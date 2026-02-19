@@ -1785,6 +1785,34 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     bn.log_error(f"Error handling patch request: {e}")
                     self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/scanLuaApi":
+                namespace_filter = params.get("filter", "")
+                try:
+                    result = self.endpoints.scan_lua_api_strings(namespace_filter, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error scanning Lua API strings: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/scanRtti":
+                class_filter = params.get("filter", "")
+                try:
+                    result = self.endpoints.scan_rtti_entries(class_filter, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error scanning RTTI entries: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/scanUpdateFields":
+                object_type = params.get("filter", "")
+                try:
+                    result = self.endpoints.scan_update_fields(object_type, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error scanning update fields: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
             else:
                 self._send_json_response({"error": "Not found"}, 404)
 
@@ -2271,6 +2299,31 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     self._send_json_response({"error": str(ve)}, 400)
                 except Exception as e:
                     bn.log_error(f"Error handling patch request: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/batchRename":
+                renames_raw = params.get("renames", "")
+                if isinstance(renames_raw, str):
+                    try:
+                        renames_list = json.loads(renames_raw)
+                    except (json.JSONDecodeError, ValueError):
+                        self._send_json_response(
+                            {"error": "Invalid JSON for renames parameter"}, 400
+                        )
+                        return
+                elif isinstance(renames_raw, list):
+                    renames_list = renames_raw
+                else:
+                    self._send_json_response(
+                        {"error": "renames must be a JSON array of {address, name} objects"}, 400
+                    )
+                    return
+
+                try:
+                    result = self.endpoints.batch_rename_functions(renames_list)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error in batch rename: {e}")
                     self._send_json_response({"error": str(e)}, 500)
 
             else:

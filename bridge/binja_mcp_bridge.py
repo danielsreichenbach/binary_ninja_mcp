@@ -969,6 +969,133 @@ def patch_bytes(address: str, data: str, save_to_file: bool = True) -> str:
     return str(result)
 
 
+@mcp.tool()
+def wowemulation_scan_lua_api_strings(namespace_filter: str = "", offset: int = 0, limit: int = 100) -> str:
+    """
+    Scan for Lua API 'Usage:' strings and find their associated native function pointers.
+    Useful for WoW binary analysis to map Lua API names to C function addresses.
+
+    Args:
+        namespace_filter: Optional filter string (e.g. 'Unit' to find UnitName, UnitLevel, etc.)
+        offset: Pagination offset
+        limit: Maximum entries to return
+    """
+    data = get_json("wowemulation/scanLuaApi", {
+        "filter": namespace_filter, "offset": offset, "limit": limit
+    }, timeout=30)
+    if not data:
+        return "Error: no response from server"
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+    entries = data.get("entries", [])
+    total = data.get("total", 0)
+    lines = [f"Lua API strings: {len(entries)} shown, {total} total"]
+    for e in entries:
+        func_info = f" -> {e.get('func_name', '?')} @ {e.get('func_addr', '?')}" if e.get("func_addr") else ""
+        lines.append(f"  {e.get('string_addr', '?')}: {e.get('string', '?')}{func_info}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def wowemulation_scan_rtti_entries(class_filter: str = "", offset: int = 0, limit: int = 100) -> str:
+    """
+    Scan for MSVC RTTI type_info entries and their associated vtables.
+    Returns class names, type_info addresses, vtable addresses, and virtual function counts.
+
+    Args:
+        class_filter: Optional filter string (e.g. 'CUnit' to find CUnit-related classes)
+        offset: Pagination offset
+        limit: Maximum entries to return
+    """
+    data = get_json("wowemulation/scanRtti", {
+        "filter": class_filter, "offset": offset, "limit": limit
+    }, timeout=30)
+    if not data:
+        return "Error: no response from server"
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+    entries = data.get("entries", [])
+    total = data.get("total", 0)
+    lines = [f"RTTI entries: {len(entries)} shown, {total} total"]
+    for e in entries:
+        vtable = e.get("vtable_addr", "none")
+        vfuncs = e.get("num_vfuncs", 0)
+        lines.append(f"  {e.get('class_name', '?')} @ ti={e.get('type_info_addr', '?')} vt={vtable} ({vfuncs} vfuncs)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def wowemulation_scan_update_fields(object_type: str = "", offset: int = 0, limit: int = 100) -> str:
+    """
+    Scan for WoW update field strings (CG*Data:: patterns) and their handler functions.
+    Useful for mapping update field names to their accessor/mutator functions.
+
+    Args:
+        object_type: Optional filter (e.g. 'CGUnitData', 'CGPlayerData')
+        offset: Pagination offset
+        limit: Maximum entries to return
+    """
+    data = get_json("wowemulation/scanUpdateFields", {
+        "filter": object_type, "offset": offset, "limit": limit
+    }, timeout=30)
+    if not data:
+        return "Error: no response from server"
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+    entries = data.get("entries", [])
+    total = data.get("total", 0)
+    lines = [f"Update fields: {len(entries)} shown, {total} total"]
+    for e in entries:
+        handler = f" -> {e.get('handler_name', '?')} @ {e.get('handler_addr', '?')}" if e.get("handler_addr") else ""
+        lines.append(f"  {e.get('string_addr', '?')}: {e.get('field_name', '?')}{handler}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def wowemulation_batch_rename_functions(renames: str) -> str:
+    """
+    Rename multiple functions in one MCP call. Accepts a JSON-encoded list of
+    {address, name} pairs.
+
+    Args:
+        renames: JSON string like [{"address": "0x401000", "name": "MyFunc"}, ...]
+    """
+    import json as _json
+    try:
+        renames_list = _json.loads(renames)
+    except (_json.JSONDecodeError, ValueError) as e:
+        return f"Error: Invalid JSON - {e}"
+
+    if not isinstance(renames_list, list):
+        return "Error: renames must be a JSON array"
+
+    try:
+        response = requests.post(
+            f"{binja_server_url}/wowemulation/batchRename",
+            json={"renames": renames_list},
+            timeout=30,
+        )
+        response.encoding = "utf-8"
+        data = response.json()
+    except Exception as e:
+        return f"Error: request failed - {e}"
+
+    if isinstance(data, dict) and "error" in data and "success_count" not in data:
+        return f"Error: {data['error']}"
+
+    success = data.get("success_count", 0)
+    failure = data.get("failure_count", 0)
+    total = data.get("total", 0)
+    msg = f"Renamed {success}/{total} functions ({failure} failures)"
+
+    # Show failures if any
+    for r in data.get("results", []):
+        if r.get("status") == "error":
+            msg += f"\n  FAIL {r.get('address', '?')}: {r.get('error', '?')}"
+
+    return msg
+
+
 if __name__ == "__main__":
     # Important: write any logs to stderr to avoid corrupting MCP stdio JSON-RPC
     print("Starting MCP bridge service...", file=_sys.stderr)

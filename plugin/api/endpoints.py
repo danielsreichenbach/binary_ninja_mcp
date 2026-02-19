@@ -939,3 +939,29 @@ class BinaryNinjaEndpoints:
         except Exception as e:
             bn.log_error(f"Error patching bytes: {e}")
             raise ValueError(f"Failed to patch bytes: {e!s}")
+
+    # -------- WoW Emulation Tools --------
+
+    def scan_lua_api_strings(self, namespace_filter: str = "", offset: int = 0, limit: int = 100) -> dict:
+        """Scan for Lua API strings and associated function pointers."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.scan_lua_api_strings(namespace_filter, offset, limit)
+
+    def scan_rtti_entries(self, class_filter: str = "", offset: int = 0, limit: int = 100) -> dict:
+        """Scan for RTTI entries and their vtables."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.scan_rtti_entries(class_filter, offset, limit)
+
+    def scan_update_fields(self, object_type: str = "", offset: int = 0, limit: int = 100) -> dict:
+        """Scan for WoW update field strings and handlers."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.scan_update_fields(object_type, offset, limit)
+
+    def batch_rename_functions(self, renames: list[dict]) -> dict:
+        """Rename multiple functions in one call."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.batch_rename_functions(renames)

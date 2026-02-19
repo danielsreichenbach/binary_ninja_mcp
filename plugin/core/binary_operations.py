@@ -3566,3 +3566,231 @@ class BinaryOperations:
             bn.log_warn(f"Error during codesign: {e}")
 
         return result
+
+    # -------- WoW Emulation Tools --------
+
+    def scan_lua_api_strings(self, namespace_filter: str = "", offset: int = 0, limit: int = 100) -> dict:
+        """Scan for Lua API 'Usage:' strings and find associated native function pointers.
+
+        Searches for strings starting with 'Usage: ' or matching Lua C API patterns,
+        then traces xrefs to find the registering function and the native handler address.
+
+        Returns dict with 'entries' list and 'total' count.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "entries": [], "total": 0}
+
+        entries = []
+
+        for s in bv.strings:
+            val = s.value
+            if not val:
+                continue
+            if not (val.startswith("Usage: ") or ("::" in val and "(" in val)):
+                continue
+
+            if namespace_filter and namespace_filter.lower() not in val.lower():
+                continue
+
+            entry = {
+                "string": val,
+                "string_addr": hex(s.start),
+                "func_addr": None,
+                "func_name": None,
+            }
+
+            code_refs = list(bv.get_code_refs(s.start))
+            if code_refs:
+                ref_func = code_refs[0].function
+                if ref_func:
+                    entry["func_addr"] = hex(ref_func.start)
+                    entry["func_name"] = ref_func.name
+
+            entries.append(entry)
+
+        total = len(entries)
+        paginated = entries[offset:offset + limit]
+
+        return {"entries": paginated, "total": total, "offset": offset, "limit": limit}
+
+    def scan_rtti_entries(self, class_filter: str = "", offset: int = 0, limit: int = 100) -> dict:
+        """Scan for RTTI type_info entries and their associated vtables.
+
+        Finds MSVC RTTI type_info structures by searching for the '.?AV' mangled name prefix.
+
+        Returns dict with 'entries' list and 'total' count.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "entries": [], "total": 0}
+
+        entries = []
+        is_64bit = bv.arch.name == "x86_64"
+
+        for s in bv.strings:
+            val = s.value
+            if not val:
+                continue
+            if not val.startswith(".?A"):
+                continue
+
+            if class_filter and class_filter.lower() not in val.lower():
+                continue
+
+            demangled = val
+            try:
+                _, qname = bn.demangle_ms(bv.arch, val)
+                if qname:
+                    demangled = "::".join(str(part) for part in qname)
+            except Exception:
+                pass
+
+            entry = {
+                "mangled_name": val,
+                "class_name": demangled,
+                "type_info_addr": None,
+                "vtable_addr": None,
+                "num_vfuncs": 0,
+            }
+
+            name_offset = 0x10 if is_64bit else 0x08
+            type_info_addr = s.start - name_offset
+            entry["type_info_addr"] = hex(type_info_addr)
+
+            data_refs_to_ti = list(bv.get_data_refs(type_info_addr))
+            for ref in data_refs_to_ti:
+                col_candidate = ref
+                ptr_size = 8 if is_64bit else 4
+                vtable_candidate = col_candidate - ptr_size
+
+                vtable_refs = list(bv.get_data_refs_from(vtable_candidate))
+                if vtable_refs:
+                    func_at = bv.get_function_at(vtable_refs[0])
+                    if func_at:
+                        entry["vtable_addr"] = hex(vtable_candidate)
+                        count = 0
+                        addr = vtable_candidate
+                        while True:
+                            refs = list(bv.get_data_refs_from(addr))
+                            if not refs:
+                                break
+                            seg = bv.get_segment_at(refs[0])
+                            if not seg or not seg.executable:
+                                break
+                            count += 1
+                            addr += ptr_size
+                        entry["num_vfuncs"] = count
+                        break
+
+            entries.append(entry)
+
+        total = len(entries)
+        paginated = entries[offset:offset + limit]
+
+        return {"entries": paginated, "total": total, "offset": offset, "limit": limit}
+
+    def scan_update_fields(self, object_type: str = "", offset: int = 0, limit: int = 100) -> dict:
+        """Scan for WoW update field strings (CG*Data:: patterns) and their handler functions.
+
+        Returns dict with 'entries' list and 'total' count.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "entries": [], "total": 0}
+
+        entries = []
+
+        for s in bv.strings:
+            val = s.value
+            if not val:
+                continue
+            if not (val.startswith("CG") and "Data::" in val):
+                continue
+
+            if object_type and object_type.lower() not in val.lower():
+                continue
+
+            entry = {
+                "field_name": val,
+                "string_addr": hex(s.start),
+                "handler_addr": None,
+                "handler_name": None,
+            }
+
+            code_refs = list(bv.get_code_refs(s.start))
+            if code_refs:
+                ref_func = code_refs[0].function
+                if ref_func:
+                    entry["handler_addr"] = hex(ref_func.start)
+                    entry["handler_name"] = ref_func.name
+
+            entries.append(entry)
+
+        total = len(entries)
+        paginated = entries[offset:offset + limit]
+
+        return {"entries": paginated, "total": total, "offset": offset, "limit": limit}
+
+    def batch_rename_functions(self, renames: list[dict]) -> dict:
+        """Rename multiple functions in a single call.
+
+        Args:
+            renames: List of dicts with 'address' (hex string or int) and 'name' fields.
+
+        Returns dict with 'success_count', 'failure_count', and 'results' list.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "success_count": 0, "failure_count": 0, "results": []}
+
+        results = []
+        success_count = 0
+        failure_count = 0
+
+        for item in renames:
+            addr_raw = item.get("address", "")
+            name = item.get("name", "")
+            result_item = {"address": addr_raw, "name": name}
+
+            try:
+                if isinstance(addr_raw, int):
+                    addr = addr_raw
+                elif isinstance(addr_raw, str):
+                    addr_str = addr_raw.strip()
+                    if addr_str.lower().startswith("0x"):
+                        addr = int(addr_str, 16)
+                    else:
+                        addr = int(addr_str, 16)
+                else:
+                    result_item["status"] = "error"
+                    result_item["error"] = f"Invalid address type: {type(addr_raw)}"
+                    failure_count += 1
+                    results.append(result_item)
+                    continue
+
+                func = bv.get_function_at(addr)
+                if func is None:
+                    result_item["status"] = "error"
+                    result_item["error"] = f"No function at address {hex(addr)}"
+                    failure_count += 1
+                else:
+                    old_name = func.name
+                    func.name = name
+                    result_item["status"] = "ok"
+                    result_item["old_name"] = old_name
+                    success_count += 1
+
+            except Exception as e:
+                result_item["status"] = "error"
+                result_item["error"] = str(e)
+                failure_count += 1
+
+            results.append(result_item)
+
+        return {
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "total": len(renames),
+            "results": results,
+        }
