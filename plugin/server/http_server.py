@@ -15,7 +15,7 @@ from ..utils.string_utils import parse_int_or_default
 
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
-    binary_ops = None  # Will be set by the server
+    binary_ops: BinaryOperations | None = None  # Will be set by the server
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -119,6 +119,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         if "text/plain" in content_type.lower() or not content_type:
             return {"name": post_data.strip()}
 
+        return {}
+
     # ---------- Helpers ----------
     def _resolve_name_to_address(self, ident: str):
         """Resolve a symbol name or hex address string to (address:int, label:str).
@@ -147,7 +149,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             get_raw = getattr(bv, "get_symbol_by_raw_name", None)
             sym = get_raw(s) if callable(get_raw) else None
             if sym and hasattr(sym, "address"):
-                return int(sym.address), getattr(sym, "name", s)
+                return int(getattr(sym, "address")), getattr(sym, "name", s)
         except Exception:
             pass
         # Pretty name
@@ -155,7 +157,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             get_by_name = getattr(bv, "get_symbol_by_name", None)
             sym = get_by_name(s) if callable(get_by_name) else None
             if sym and hasattr(sym, "address"):
-                return int(sym.address), getattr(sym, "name", s)
+                return int(getattr(sym, "address")), getattr(sym, "name", s)
         except Exception:
             pass
         # Heuristic: BN auto-generated data labels like data_100003f66, byte_..., word_..., dword_..., qword_..., off_..., unk_...
@@ -214,7 +216,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def do_GET(self):
+    def do_GET(self):  # type: ignore[reportGeneralTypeIssues]
         try:
             # For all endpoints except /status, /convertNumber, /platforms, /binaries, /views, /selectBinary, check loaded
             if (
@@ -229,6 +231,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 and not self._check_binary_loaded()
             ):
                 return
+            assert self.binary_ops is not None
 
             params = self._parse_query_params()
             path = urllib.parse.urlparse(self.path).path
@@ -1830,6 +1833,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         - Decompiled function code and metadata
         - Error message with available functions list
         """
+        assert self.binary_ops is not None
         try:
             func_info = self.binary_ops.get_function_info(function_name)
             if not func_info:
@@ -1872,6 +1876,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         try:
             if not self._check_binary_loaded():
                 return
+            assert self.binary_ops is not None
 
             params = self._parse_post_params()
             path = urllib.parse.urlparse(self.path).path
@@ -1931,10 +1936,11 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     bn.log_info(f"Applied prefix '{prefix}': {new_name}")
 
                 # Get function info for validation
-                func_info = self.binary_ops.get_function_info(old_name)
+                old_name_str = str(old_name) if not isinstance(old_name, str) else old_name
+                func_info = self.binary_ops.get_function_info(old_name_str)
                 if func_info:
                     bn.log_info(f"Found function: {func_info}")
-                    success = self.binary_ops.rename_function(old_name, new_name)
+                    success = self.binary_ops.rename_function(old_name_str, new_name)
                     if success:
                         self._send_json_response(
                             {

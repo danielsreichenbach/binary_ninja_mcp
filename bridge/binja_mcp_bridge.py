@@ -10,6 +10,8 @@ def _bridge_excepthook(exc_type, exc, tb):
 
 _sys.excepthook = _bridge_excepthook
 
+from typing import Any
+
 import requests
 from mcp.server.fastmcp import FastMCP
 
@@ -54,7 +56,7 @@ def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 
         return [f"Request failed: {e!s}"]
 
 
-def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 5):
+def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 5) -> Any:
     """
     Perform a GET and return parsed JSON.
     - On 2xx: returns parsed JSON.
@@ -86,7 +88,7 @@ def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 
             # Ensure at least an error field for LLMs
             if "error" not in data:
                 data = {"error": str(data)}
-            data.setdefault("status", response.status_code)
+            data.setdefault("status", str(response.status_code))
             return data
         text = (response.text or "").strip()
         return {"error": f"Error {response.status_code}: {text}"}
@@ -286,9 +288,9 @@ def hexdump_address(address: str, length: int = -1) -> str:
     """
     Hexdump data starting at an address. When length < 0, reads the exact defined size if available.
     """
-    params = {"address": address}
+    params: dict[str, str] = {"address": address}
     if length is not None:
-        params["length"] = length
+        params["length"] = str(length)
     return get_text("hexdump", params, timeout=None)
 
 
@@ -300,7 +302,7 @@ def hexdump_data(name_or_address: str, length: int = -1) -> str:
     ident = (name_or_address or "").strip()
     if ident.startswith("0x"):
         return hexdump_address(ident, length)
-    return get_text("hexdumpByName", {"name": ident, "length": length}, timeout=None)
+    return get_text("hexdumpByName", {"name": ident, "length": str(length)}, timeout=None)
 
 
 @mcp.tool()
@@ -310,9 +312,9 @@ def get_data_decl(name_or_address: str, length: int = -1) -> str:
     LLM-friendly: includes both a C-like declaration (when possible) and text hexdump.
     """
     ident = (name_or_address or "").strip()
-    params = {"name": ident} if not ident.startswith("0x") else {"address": ident}
+    params: dict[str, str] = {"name": ident} if not ident.startswith("0x") else {"address": ident}
     if length is not None:
-        params["length"] = length
+        params["length"] = str(length)
     data = get_json("getDataDecl", params, timeout=None)
     if not data:
         return "Error: no response"
@@ -676,7 +678,7 @@ def delete_function_comment(function_name: str) -> str:
 
 
 @mcp.tool()
-def function_at(address: str) -> str:
+def function_at(address: str) -> list:
     """
     Retrive the name of the function the address belongs to. Address must be in hexadecimal format 0x00001
     """
@@ -684,7 +686,7 @@ def function_at(address: str) -> str:
 
 
 @mcp.tool()
-def get_user_defined_type(type_name: str) -> str:
+def get_user_defined_type(type_name: str) -> list:
     """
     Retrive definition of a user defined type (struct, enumeration, typedef, union)
     """
@@ -970,7 +972,9 @@ def patch_bytes(address: str, data: str, save_to_file: bool = True) -> str:
 
 
 @mcp.tool()
-def wowemulation_scan_lua_api_strings(namespace_filter: str = "", offset: int = 0, limit: int = 100) -> str:
+def wowemulation_scan_lua_api_strings(
+    namespace_filter: str = "", offset: int = 0, limit: int = 100
+) -> str:
     """
     Scan for Lua API 'Usage:' strings and find their associated native function pointers.
     Useful for WoW binary analysis to map Lua API names to C function addresses.
@@ -980,9 +984,11 @@ def wowemulation_scan_lua_api_strings(namespace_filter: str = "", offset: int = 
         offset: Pagination offset
         limit: Maximum entries to return
     """
-    data = get_json("wowemulation/scanLuaApi", {
-        "filter": namespace_filter, "offset": offset, "limit": limit
-    }, timeout=30)
+    data = get_json(
+        "wowemulation/scanLuaApi",
+        {"filter": namespace_filter, "offset": offset, "limit": limit},
+        timeout=30,
+    )
     if not data:
         return "Error: no response from server"
     if isinstance(data, dict) and "error" in data:
@@ -991,13 +997,19 @@ def wowemulation_scan_lua_api_strings(namespace_filter: str = "", offset: int = 
     total = data.get("total", 0)
     lines = [f"Lua API strings: {len(entries)} shown, {total} total"]
     for e in entries:
-        func_info = f" -> {e.get('func_name', '?')} @ {e.get('func_addr', '?')}" if e.get("func_addr") else ""
+        func_info = (
+            f" -> {e.get('func_name', '?')} @ {e.get('func_addr', '?')}"
+            if e.get("func_addr")
+            else ""
+        )
         lines.append(f"  {e.get('string_addr', '?')}: {e.get('string', '?')}{func_info}")
     return "\n".join(lines)
 
 
 @mcp.tool()
-def wowemulation_scan_rtti_entries(class_filter: str = "", offset: int = 0, limit: int = 100) -> str:
+def wowemulation_scan_rtti_entries(
+    class_filter: str = "", offset: int = 0, limit: int = 100
+) -> str:
     """
     Scan for MSVC RTTI type_info entries and their associated vtables.
     Returns class names, type_info addresses, vtable addresses, and virtual function counts.
@@ -1007,9 +1019,11 @@ def wowemulation_scan_rtti_entries(class_filter: str = "", offset: int = 0, limi
         offset: Pagination offset
         limit: Maximum entries to return
     """
-    data = get_json("wowemulation/scanRtti", {
-        "filter": class_filter, "offset": offset, "limit": limit
-    }, timeout=30)
+    data = get_json(
+        "wowemulation/scanRtti",
+        {"filter": class_filter, "offset": offset, "limit": limit},
+        timeout=30,
+    )
     if not data:
         return "Error: no response from server"
     if isinstance(data, dict) and "error" in data:
@@ -1020,12 +1034,16 @@ def wowemulation_scan_rtti_entries(class_filter: str = "", offset: int = 0, limi
     for e in entries:
         vtable = e.get("vtable_addr", "none")
         vfuncs = e.get("num_vfuncs", 0)
-        lines.append(f"  {e.get('class_name', '?')} @ ti={e.get('type_info_addr', '?')} vt={vtable} ({vfuncs} vfuncs)")
+        lines.append(
+            f"  {e.get('class_name', '?')} @ ti={e.get('type_info_addr', '?')} vt={vtable} ({vfuncs} vfuncs)"
+        )
     return "\n".join(lines)
 
 
 @mcp.tool()
-def wowemulation_scan_update_fields(object_type: str = "", offset: int = 0, limit: int = 100) -> str:
+def wowemulation_scan_update_fields(
+    object_type: str = "", offset: int = 0, limit: int = 100
+) -> str:
     """
     Scan for WoW update field strings (CG*Data:: patterns) and their handler functions.
     Useful for mapping update field names to their accessor/mutator functions.
@@ -1035,9 +1053,11 @@ def wowemulation_scan_update_fields(object_type: str = "", offset: int = 0, limi
         offset: Pagination offset
         limit: Maximum entries to return
     """
-    data = get_json("wowemulation/scanUpdateFields", {
-        "filter": object_type, "offset": offset, "limit": limit
-    }, timeout=30)
+    data = get_json(
+        "wowemulation/scanUpdateFields",
+        {"filter": object_type, "offset": offset, "limit": limit},
+        timeout=30,
+    )
     if not data:
         return "Error: no response from server"
     if isinstance(data, dict) and "error" in data:
@@ -1046,7 +1066,11 @@ def wowemulation_scan_update_fields(object_type: str = "", offset: int = 0, limi
     total = data.get("total", 0)
     lines = [f"Update fields: {len(entries)} shown, {total} total"]
     for e in entries:
-        handler = f" -> {e.get('handler_name', '?')} @ {e.get('handler_addr', '?')}" if e.get("handler_addr") else ""
+        handler = (
+            f" -> {e.get('handler_name', '?')} @ {e.get('handler_addr', '?')}"
+            if e.get("handler_addr")
+            else ""
+        )
         lines.append(f"  {e.get('string_addr', '?')}: {e.get('field_name', '?')}{handler}")
     return "\n".join(lines)
 
@@ -1061,6 +1085,7 @@ def wowemulation_batch_rename_functions(renames: str) -> str:
         renames: JSON string like [{"address": "0x401000", "name": "MyFunc"}, ...]
     """
     import json as _json
+
     try:
         renames_list = _json.loads(renames)
     except (_json.JSONDecodeError, ValueError) as e:

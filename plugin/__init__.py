@@ -167,7 +167,7 @@ def _sidebar_icon_margin_default() -> int:
         mw = getattr(ctx, "mainWindow", None)
         mw = mw() if callable(mw) else mw
         if mw and hasattr(mw, "style"):
-            st = mw.style()
+            st = mw.style()  # type: ignore[union-attr]
             if st:
                 val = int(st.pixelMetric(QStyle.PM_ToolBarIconSize))
                 if val > 0:
@@ -200,7 +200,7 @@ def _ensure_status_indicator():
             mw = mw() if callable(mw) else mw
             if mw is None or not hasattr(mw, "statusBar"):
                 return
-            sb = mw.statusBar()
+            sb = mw.statusBar()  # type: ignore[union-attr]
             if sb is None:
                 return
             # Tighten status bar spacing
@@ -348,7 +348,7 @@ def _start_indicator_watcher():
             try:
                 _ensure_status_indicator()
                 _set_status_indicator(bool(plugin.server and plugin.server.server))
-                if _status_button is not None and hasattr(_indicator_timer, "stop"):
+                if _status_button is not None and _indicator_timer is not None and hasattr(_indicator_timer, "stop"):
                     _indicator_timer.stop()
             except Exception:
                 pass
@@ -360,7 +360,8 @@ def _start_indicator_watcher():
         def _start():
             try:
                 _tick()
-                _indicator_timer.start()
+                if _indicator_timer is not None:
+                    _indicator_timer.start()
             except Exception:
                 pass
 
@@ -473,8 +474,8 @@ def _start_bv_monitor():
                             frames = getter()
                         elif getter is not None:
                             frames = getter
-                        if frames:
-                            for vf2 in list(frames):
+                        if frames and hasattr(frames, "__iter__"):
+                            for vf2 in list(frames):  # type: ignore[arg-type]
                                 _collect_from_frame(vf2)
                     except Exception:
                         continue
@@ -554,7 +555,8 @@ def _start_bv_monitor():
         def _start():
             try:
                 _tick()
-                _bv_monitor_timer.start()
+                if _bv_monitor_timer is not None:
+                    _bv_monitor_timer.start()
             except Exception:
                 pass
 

@@ -640,8 +640,9 @@ class BinaryNinjaEndpoints:
                         # Otherwise pick the first type that looks like a function
                         for name, tobj in pr.types.items():
                             try:
-                                if hasattr(tobj, "type_class") and int(
-                                    getattr(bn.enums, "TypeClass", object).FunctionTypeClass
+                                tc_enum = getattr(bn.enums, "TypeClass", None)
+                                if hasattr(tobj, "type_class") and tc_enum is not None and int(
+                                    getattr(tc_enum, "FunctionTypeClass", -1)
                                 ) == int(getattr(tobj, "type_class")):
                                     chosen = tobj
                                     break
@@ -942,7 +943,9 @@ class BinaryNinjaEndpoints:
 
     # -------- WoW Emulation Tools --------
 
-    def scan_lua_api_strings(self, namespace_filter: str = "", offset: int = 0, limit: int = 100) -> dict:
+    def scan_lua_api_strings(
+        self, namespace_filter: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
         """Scan for Lua API strings and associated function pointers."""
         if not self.binary_ops.current_view:
             raise RuntimeError("No binary loaded")

@@ -183,12 +183,12 @@ class BinaryOperations:
         self._prune_views()
         return len(to_delete)
 
-    def list_open_binaries(self) -> list[dict[str, str]]:
+    def list_open_binaries(self) -> list[dict[str, str | bool]]:
         """Return a list of managed/open binaries with ids.
 
         Note: Tracks binaries opened via this plugin or explicitly registered as current_view.
         """
-        items: list[dict[str, str]] = []
+        items: list[dict[str, str | bool]] = []
         # Cleanup first
         self._prune_views()
         # Do NOT auto-register current_view here; UI monitor handles discovery.
@@ -220,7 +220,7 @@ class BinaryOperations:
                 vb_canon = vb
             entries.append((canonical_id, fn, bool(vb_canon is self._current_view)))
         # Sort by filename for stable ordering
-        entries.sort(key=lambda t: (t[1] or ""))
+        entries.sort(key=lambda t: t[1] or "")
         for cid, fn, active in entries:
             items.append({"id": cid, "filename": fn, "active": active})
         return items
@@ -250,7 +250,7 @@ class BinaryOperations:
                     lst = self.list_open_binaries()  # sorted order
                     if 1 <= idx <= len(lst):
                         fname = lst[idx - 1].get("filename")
-                        if fname:
+                        if fname and isinstance(fname, str):
                             map_id = self._id_by_filename.get(fname)
                             if map_id:
                                 wmap = self._views_by_id.get(map_id)
@@ -1260,7 +1260,9 @@ class BinaryOperations:
                 # Fallback: try to resolve missing type object by querying BV / libraries
                 if tobj is None:
                     try:
-                        if hasattr(self._current_view, "get_type_by_name"):
+                        if self._current_view is not None and hasattr(
+                            self._current_view, "get_type_by_name"
+                        ):
                             t2 = self._current_view.get_type_by_name(name_str)
                             if t2 is not None:
                                 tobj = t2
@@ -1426,7 +1428,9 @@ class BinaryOperations:
                             try:
                                 get_names = getattr(lib, "get_type_names", None)
                                 if callable(get_names):
-                                    names = list(get_names())
+                                    result = get_names()
+                                    if hasattr(result, "__iter__"):
+                                        names = list(result)  # type: ignore[arg-type]
                             except Exception:
                                 pass
                         # Fetch each type object if possible
@@ -1864,7 +1868,7 @@ class BinaryOperations:
             if not func:
                 return False
 
-            func.comment = None
+            self._current_view.set_comment_at(func.start, None)
             return True
         except Exception as e:
             bn.log_error(f"Failed to delete function comment: {e}")
@@ -3569,7 +3573,9 @@ class BinaryOperations:
 
     # -------- WoW Emulation Tools --------
 
-    def scan_lua_api_strings(self, namespace_filter: str = "", offset: int = 0, limit: int = 100) -> dict:
+    def scan_lua_api_strings(
+        self, namespace_filter: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
         """Scan for Lua API 'Usage:' strings and find associated native function pointers.
 
         Searches for strings starting with 'Usage: ' or matching Lua C API patterns,
@@ -3610,7 +3616,7 @@ class BinaryOperations:
             entries.append(entry)
 
         total = len(entries)
-        paginated = entries[offset:offset + limit]
+        paginated = entries[offset : offset + limit]
 
         return {"entries": paginated, "total": total, "offset": offset, "limit": limit}
 
@@ -3686,7 +3692,7 @@ class BinaryOperations:
             entries.append(entry)
 
         total = len(entries)
-        paginated = entries[offset:offset + limit]
+        paginated = entries[offset : offset + limit]
 
         return {"entries": paginated, "total": total, "offset": offset, "limit": limit}
 
@@ -3728,7 +3734,7 @@ class BinaryOperations:
             entries.append(entry)
 
         total = len(entries)
-        paginated = entries[offset:offset + limit]
+        paginated = entries[offset : offset + limit]
 
         return {"entries": paginated, "total": total, "offset": offset, "limit": limit}
 
@@ -3742,7 +3748,12 @@ class BinaryOperations:
         """
         bv = self._current_view
         if not bv:
-            return {"error": "No binary loaded", "success_count": 0, "failure_count": 0, "results": []}
+            return {
+                "error": "No binary loaded",
+                "success_count": 0,
+                "failure_count": 0,
+                "results": [],
+            }
 
         results = []
         success_count = 0
