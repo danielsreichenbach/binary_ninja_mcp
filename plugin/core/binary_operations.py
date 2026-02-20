@@ -1026,7 +1026,8 @@ class BinaryOperations:
         }
 
     def get_defined_data(
-        self, offset: int = 0, limit: int = 100, read_len: int = 32
+        self, offset: int = 0, limit: int = 100, read_len: int = 32,
+        filter_name: str = ""
     ) -> list[dict[str, Any]]:
         """Get list of defined data variables with lightweight previews and sizes.
 
@@ -1040,12 +1041,36 @@ class BinaryOperations:
         - bytes_hex: hex string of up to preview_len bytes
         - ascii_preview: printable ASCII representation for the same bytes
         - repr: concise, human-friendly summary for LLMs (value/ASCII/hex)
+
+        When filter_name is non-empty, only data items whose symbol name
+        contains the substring (case-insensitive) are returned. Pagination
+        is applied during iteration to avoid processing all items.
         """
         if not self._current_view:
             raise RuntimeError("No binary loaded")
 
         data_items = []
+        filter_lower = filter_name.lower() if filter_name else ""
+        matched = 0  # count of items passing the filter
+
         for var in self._current_view.data_vars:
+            # Early filter: check symbol name before expensive processing
+            if filter_lower:
+                sym = self._current_view.get_symbol_at(var)
+                sym_name = sym.name if sym else ""
+                if filter_lower not in sym_name.lower():
+                    continue
+            else:
+                sym = None  # defer symbol lookup to later
+
+            # Pagination: skip items before offset
+            if matched < offset:
+                matched += 1
+                continue
+            # Stop once we have enough items
+            if len(data_items) >= limit:
+                break
+            matched += 1
             data_type = None  # may be a BN Type or a DataVariable
             value = None
             width = None
@@ -1119,8 +1144,10 @@ class BinaryOperations:
                 data_type = None
                 typ_obj = None
 
-            # If BN doesn't expose a width, try to infer size from call sites
-            if width is None:
+            # If BN doesn't expose a width, try to infer size from call sites.
+            # Skip this expensive HLIL analysis when filtering (caller wants
+            # discovery, not precise sizing).
+            if width is None and not filter_lower:
                 try:
                     inferred = self.infer_data_size(int(var))
                     if isinstance(inferred, int) and inferred > 0:
@@ -1128,8 +1155,9 @@ class BinaryOperations:
                 except Exception:
                     pass
 
-            # Get symbol information
-            sym = self._current_view.get_symbol_at(var)
+            # Get symbol information (may already be resolved by filter)
+            if sym is None:
+                sym = self._current_view.get_symbol_at(var)
             # Choose a concise repr for LLMs
             if value is not None:
                 short_repr = f"int:{value}"
@@ -1161,7 +1189,7 @@ class BinaryOperations:
                 }
             )
 
-        return data_items[offset : offset + limit]
+        return data_items
 
     def infer_data_size(self, address: int) -> int | None:
         """Infer size for data at address when BN hasn't defined a type width.

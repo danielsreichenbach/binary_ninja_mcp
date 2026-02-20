@@ -576,11 +576,23 @@ def list_namespaces(offset: int = 0, limit: int = 100) -> list:
 
 
 @mcp.tool()
-def list_data_items(offset: int = 0, limit: int = 100) -> list:
+def list_data_items(offset: int = 0, limit: int = 100, filter: str = "") -> list:
     """
     List defined data labels and their values with pagination.
+    When filter is non-empty, only items whose name contains the substring
+    (case-insensitive) are returned.
     """
-    return safe_get("data", {"offset": offset, "limit": limit})
+    return safe_get("data", {"offset": offset, "limit": limit, "filter": filter})
+
+
+@mcp.tool()
+def search_data_items(query: str, offset: int = 0, limit: int = 100) -> list:
+    """
+    Search for data labels whose name contains the given substring.
+    """
+    if not query:
+        return ["Error: query string is required"]
+    return safe_get("data", {"offset": offset, "limit": limit, "filter": query})
 
 
 @mcp.tool()

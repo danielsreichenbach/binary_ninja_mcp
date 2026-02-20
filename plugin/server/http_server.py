@@ -324,7 +324,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     else:
                         # Default: read exact defined size when available
                         read_len = -1
-                    data_items = self.binary_ops.get_defined_data(offset, limit, read_len)
+                    filter_name = params.get("filter", "")
+                    data_items = self.binary_ops.get_defined_data(offset, limit, read_len, filter_name)
                     self._send_json_response({"data": data_items})
                 except Exception as e:
                     bn.log_error(f"Error getting data items: {e}")
