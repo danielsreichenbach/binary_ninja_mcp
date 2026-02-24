@@ -1,5 +1,6 @@
 import platform
 import re
+import struct
 import subprocess
 import weakref
 from typing import Any
@@ -3831,5 +3832,759 @@ class BinaryOperations:
             "success_count": success_count,
             "failure_count": failure_count,
             "total": len(renames),
+            "results": results,
+        }
+
+    def discover_lua_reg_tables(
+        self, min_entries: int = 3, offset: int = 0, limit: int = 50
+    ) -> dict:
+        """Scan .rdata and .data for luaL_Reg-style {char*, func*} registration tables.
+
+        Reads raw section bytes and checks pointer pairs at pointer-width intervals.
+        Groups consecutive valid entries into tables, then validates string content.
+
+        Args:
+            min_entries: Minimum entries for a run to be reported as a table.
+            offset: Pagination offset (on discovered tables list).
+            limit: Maximum tables to return.
+
+        Returns:
+            dict with 'tables' list, 'total' table count, 'total_entries' entry count.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "tables": [], "total": 0, "total_entries": 0}
+
+        is_64bit = bv.arch.name == "x86_64"
+        ptr_size = 8 if is_64bit else 4
+        entry_size = ptr_size * 2
+        unpack_fmt = "<QQ" if is_64bit else "<II"
+
+        # Collect section ranges
+        rdata_ranges = []
+        data_ranges = []
+        text_ranges = []
+        for name, sec in bv.sections.items():
+            if name in (".rdata", ".rodata"):
+                rdata_ranges.append((sec.start, sec.end))
+            elif name == ".data":
+                data_ranges.append((sec.start, sec.end))
+            elif name == ".text":
+                text_ranges.append((sec.start, sec.end))
+
+        all_data_ranges = rdata_ranges + data_ranges
+        if not all_data_ranges or not text_ranges or not rdata_ranges:
+            return {"error": "Required sections not found", "tables": [], "total": 0, "total_entries": 0}
+
+        def in_ranges(addr, ranges):
+            for start, end in ranges:
+                if start <= addr < end:
+                    return True
+            return False
+
+        def in_rdata(addr):
+            return in_ranges(addr, rdata_ranges)
+
+        def in_text(addr):
+            return in_ranges(addr, text_ranges)
+
+        def read_string_at(addr, max_len=128):
+            """Read a null-terminated ASCII string from the binary."""
+            try:
+                raw = bv.read(addr, max_len)
+                if not raw:
+                    return None
+                end = raw.find(b'\x00')
+                if end < 0:
+                    return None
+                s = raw[:end]
+                try:
+                    return s.decode('ascii')
+                except UnicodeDecodeError:
+                    return None
+            except Exception:
+                return None
+
+        def is_valid_lua_name(s):
+            """Check if a string looks like a valid Lua API function name."""
+            if not s or len(s) < 1 or len(s) > 100:
+                return False
+            if not (s[0].isalpha() or s[0] == '_'):
+                return False
+            return all(c.isalnum() or c == '_' for c in s)
+
+        # Scan each data section for pointer pairs
+        tables = []
+        for sec_name, sec in bv.sections.items():
+            if sec_name not in (".rdata", ".rodata", ".data"):
+                continue
+
+            sec_data = bv.read(sec.start, sec.end - sec.start)
+            if not sec_data:
+                continue
+
+            sec_len = len(sec_data)
+            # Find runs of consecutive valid {rdata_ptr, text_ptr} entries
+            current_run = []
+            current_run_start = None
+
+            i = 0
+            while i + entry_size <= sec_len:
+                name_ptr, func_ptr = struct.unpack_from(unpack_fmt, sec_data, i)
+                addr = sec.start + i
+
+                if name_ptr != 0 and func_ptr != 0 and in_rdata(name_ptr) and in_text(func_ptr):
+                    if not current_run:
+                        current_run_start = addr
+                    current_run.append((addr, name_ptr, func_ptr))
+                else:
+                    # Check for NULL terminator {0, 0} which ends a Lua table
+                    if current_run and name_ptr == 0 and func_ptr == 0:
+                        # NULL terminator is part of the table, finalize
+                        pass
+                    if current_run and len(current_run) >= min_entries:
+                        tables.append((current_run_start, sec_name, list(current_run)))
+                    current_run = []
+                    current_run_start = None
+
+                i += entry_size
+
+            # Flush remaining run
+            if current_run and len(current_run) >= min_entries:
+                tables.append((current_run_start, sec_name, list(current_run)))
+
+        # Validate strings and build output
+        validated_tables = []
+        total_entries = 0
+
+        for table_addr, sec_name, run in tables:
+            entries = []
+            valid_names = 0
+            for _, name_ptr, func_ptr in run:
+                name_str = read_string_at(name_ptr)
+                if name_str and is_valid_lua_name(name_str):
+                    valid_names += 1
+                entries.append({
+                    "name": name_str if name_str else None,
+                    "name_addr": hex(name_ptr),
+                    "func_addr": hex(func_ptr),
+                })
+
+            # Require >= 80% valid Lua names
+            if len(entries) > 0 and (valid_names / len(entries)) >= 0.8:
+                validated_tables.append({
+                    "table_addr": hex(table_addr),
+                    "entry_count": len(entries),
+                    "valid_names": valid_names,
+                    "section": sec_name,
+                    "entries": entries,
+                })
+                total_entries += len(entries)
+
+        total = len(validated_tables)
+        paginated = validated_tables[offset:offset + limit]
+
+        return {
+            "tables": paginated,
+            "total": total,
+            "total_entries": total_entries,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    def walk_rtti_vtables(
+        self, class_filter: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Scan data sections for MSVC RTTI COL structures by matching type_info RVAs.
+
+        Reads raw section bytes from .rdata and .data (some binaries store RTTI in
+        either section). Finds COL by RVA pattern, then finds vtable by scanning for
+        a pointer to the COL address.
+
+        Args:
+            class_filter: Substring filter on class name.
+            offset: Pagination offset.
+            limit: Maximum entries to return.
+
+        Returns:
+            dict with 'entries' list and 'total' count.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "entries": [], "total": 0}
+
+        is_64bit = bv.arch.name == "x86_64"
+        ptr_size = 8 if is_64bit else 4
+
+        module_base = bv.start
+
+        # Collect all scannable data sections and .text ranges
+        # RTTI structures can be in .rdata or .data depending on the binary
+        scan_sections = []  # list of (start_addr, bytes_data)
+        text_ranges = []
+
+        for name, sec in bv.sections.items():
+            if name in (".rdata", ".rodata", ".data"):
+                sec_bytes = bv.read(sec.start, sec.end - sec.start)
+                if sec_bytes:
+                    scan_sections.append((sec.start, sec_bytes))
+            elif name == ".text":
+                text_ranges.append((sec.start, sec.end))
+
+        if not scan_sections or not text_ranges:
+            return {"error": "Required sections not found", "entries": [], "total": 0}
+
+        def in_text(addr):
+            for start, end in text_ranges:
+                if start <= addr < end:
+                    return True
+            return False
+
+        # Step 1: Find all type_info entries
+        type_infos = []
+        for s in bv.strings:
+            val = s.value
+            if not val or not val.startswith(".?A"):
+                continue
+            if class_filter and class_filter.lower() not in val.lower():
+                continue
+
+            name_offset = 0x10 if is_64bit else 0x08
+            type_info_addr = s.start - name_offset
+
+            demangled = val
+            try:
+                _, qname = bn.demangle_ms(bv.arch, val)
+                if qname:
+                    demangled = "::".join(str(part) for part in qname)
+            except Exception:
+                pass
+
+            type_infos.append((type_info_addr, val, demangled))
+
+        # Step 2: For each type_info, find COL then vtable across all data sections
+        entries = []
+
+        for ti_addr, mangled, demangled in type_infos:
+            best_vtable = None
+            best_vfunc_count = 0
+            found_col_addr = None
+
+            if is_64bit:
+                # x64 COL: signature(4)=1, offset(4), cdOffset(4),
+                #          typeDescRVA(4), classHierRVA(4), selfRVA(4)
+                # Total: 24 bytes. typeDescRVA at +12, selfRVA at +20.
+                ti_rva = ti_addr - module_base
+                ti_rva_bytes = struct.pack("<I", ti_rva & 0xFFFFFFFF)
+
+                # Scan all data sections for COL containing this type_info RVA
+                for sec_start, sec_data in scan_sections:
+                    sec_len = len(sec_data)
+                    search_offset = 0
+                    while search_offset < sec_len - 24:
+                        pos = sec_data.find(ti_rva_bytes, search_offset)
+                        if pos < 0:
+                            break
+                        search_offset = pos + 4
+
+                        col_offset = pos - 12
+                        if col_offset < 0:
+                            continue
+
+                        sig = struct.unpack_from("<I", sec_data, col_offset)[0]
+                        if sig != 1:
+                            continue
+
+                        col_addr = sec_start + col_offset
+
+                        # Verify selfRVA at +20
+                        self_rva = struct.unpack_from("<I", sec_data, col_offset + 20)[0]
+                        expected_self_rva = (col_addr - module_base) & 0xFFFFFFFF
+                        if self_rva != expected_self_rva:
+                            continue
+
+                        found_col_addr = col_addr
+                        break
+                    if found_col_addr:
+                        break
+
+                # Find vtable: scan all data sections for an 8-byte VA pointer to COL
+                if found_col_addr is not None:
+                    col_va_bytes = struct.pack("<Q", found_col_addr)
+                    for sec_start, sec_data in scan_sections:
+                        sec_len = len(sec_data)
+                        vt_search = 0
+                        while vt_search < sec_len - ptr_size:
+                            vt_pos = sec_data.find(col_va_bytes, vt_search)
+                            if vt_pos < 0:
+                                break
+                            vt_search = vt_pos + ptr_size
+
+                            vtable_file_offset = vt_pos + ptr_size
+                            vtable_addr = sec_start + vtable_file_offset
+
+                            # Walk vtable entries
+                            count = 0
+                            walk_off = vtable_file_offset
+                            while walk_off + ptr_size <= sec_len:
+                                vfunc = struct.unpack_from("<Q", sec_data, walk_off)[0]
+                                if not in_text(vfunc):
+                                    break
+                                count += 1
+                                walk_off += ptr_size
+
+                            if count > best_vfunc_count:
+                                best_vfunc_count = count
+                                best_vtable = (sec_start, sec_data, vtable_file_offset, vtable_addr)
+
+            else:
+                # x86 COL: signature(4)=0, offset(4), cdOffset(4), typeDescPtr(4)
+                # typeDescPtr is a VA (not RVA) on x86
+                ti_ptr_bytes = struct.pack("<I", ti_addr & 0xFFFFFFFF)
+
+                for sec_start, sec_data in scan_sections:
+                    sec_len = len(sec_data)
+                    search_offset = 0
+                    while search_offset < sec_len - 16:
+                        pos = sec_data.find(ti_ptr_bytes, search_offset)
+                        if pos < 0:
+                            break
+                        search_offset = pos + 4
+
+                        col_offset = pos - 12
+                        if col_offset < 0:
+                            continue
+
+                        sig = struct.unpack_from("<I", sec_data, col_offset)[0]
+                        if sig != 0:
+                            continue
+
+                        found_col_addr = sec_start + col_offset
+                        break
+                    if found_col_addr:
+                        break
+
+                if found_col_addr is not None:
+                    col_ptr_bytes = struct.pack("<I", found_col_addr & 0xFFFFFFFF)
+                    for sec_start, sec_data in scan_sections:
+                        sec_len = len(sec_data)
+                        vt_search = 0
+                        while vt_search < sec_len - ptr_size:
+                            vt_pos = sec_data.find(col_ptr_bytes, vt_search)
+                            if vt_pos < 0:
+                                break
+                            vt_search = vt_pos + ptr_size
+
+                            vtable_file_offset = vt_pos + ptr_size
+                            vtable_addr = sec_start + vtable_file_offset
+
+                            count = 0
+                            walk_off = vtable_file_offset
+                            while walk_off + ptr_size <= sec_len:
+                                vfunc = struct.unpack_from("<I", sec_data, walk_off)[0]
+                                if not in_text(vfunc):
+                                    break
+                                count += 1
+                                walk_off += ptr_size
+
+                            if count > best_vfunc_count:
+                                best_vfunc_count = count
+                                best_vtable = (sec_start, sec_data, vtable_file_offset, vtable_addr)
+
+            if best_vtable is not None:
+                _, vt_sec_data, vt_file_off, vtable_addr = best_vtable
+                vt_sec_len = len(vt_sec_data)
+                vfunc_addrs = []
+                for j in range(min(best_vfunc_count, 5)):
+                    off = vt_file_off + j * ptr_size
+                    if off + ptr_size <= vt_sec_len:
+                        fmt = "<Q" if is_64bit else "<I"
+                        va = struct.unpack_from(fmt, vt_sec_data, off)[0]
+                        vfunc_addrs.append(hex(va))
+
+                entries.append({
+                    "class_name": demangled,
+                    "mangled_name": mangled,
+                    "type_info_addr": hex(ti_addr),
+                    "vtable_addr": hex(vtable_addr),
+                    "num_vfuncs": best_vfunc_count,
+                    "first_vfuncs": vfunc_addrs,
+                })
+            else:
+                entries.append({
+                    "class_name": demangled,
+                    "mangled_name": mangled,
+                    "type_info_addr": hex(ti_addr),
+                    "vtable_addr": None,
+                    "num_vfuncs": 0,
+                    "first_vfuncs": [],
+                })
+
+        total = len(entries)
+        paginated = entries[offset:offset + limit]
+
+        return {"entries": paginated, "total": total, "offset": offset, "limit": limit}
+
+    def scan_vtables(
+        self, min_methods: int = 2, offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Scan data sections for vtable-like structures: contiguous runs of .text pointers.
+
+        Finds vtables directly by scanning .rdata and .data for consecutive
+        pointer-sized values that all point into .text. For each candidate,
+        checks vtable[-1] for an MSVC RTTI COL pointer to resolve class names.
+
+        This complements walk_rtti_vtables which requires COL structures to
+        exist. Many game binaries have stripped RTTI, so this scanner finds
+        vtables that the RTTI-based approach misses.
+
+        Args:
+            min_methods: Minimum number of consecutive .text pointers to report.
+            offset: Pagination offset.
+            limit: Maximum entries to return.
+
+        Returns:
+            dict with 'vtables' list, 'total', 'named_count', 'offset', 'limit'.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "vtables": [], "total": 0, "named_count": 0}
+
+        is_64bit = bv.arch.name == "x86_64"
+        ptr_size = 8 if is_64bit else 4
+        ptr_fmt = "<Q" if is_64bit else "<I"
+        module_base = bv.start
+
+        # Collect .text ranges and data sections
+        scan_sections = []  # list of (name, start_addr, bytes_data)
+        text_ranges = []
+        data_ranges = []  # (start, end) for all data sections
+
+        for name, sec in bv.sections.items():
+            if name in (".rdata", ".rodata", ".data"):
+                sec_bytes = bv.read(sec.start, sec.end - sec.start)
+                if sec_bytes:
+                    scan_sections.append((name, sec.start, sec_bytes))
+                    data_ranges.append((sec.start, sec.end))
+            elif name == ".text":
+                text_ranges.append((sec.start, sec.end))
+
+        if not scan_sections or not text_ranges:
+            return {"error": "Required sections not found", "vtables": [], "total": 0, "named_count": 0}
+
+        def in_text(addr):
+            for start, end in text_ranges:
+                if start <= addr < end:
+                    return True
+            return False
+
+        def in_data(addr):
+            for start, end in data_ranges:
+                if start <= addr < end:
+                    return True
+            return False
+
+        # Build type_info lookup: RVA (64-bit) or VA (32-bit) -> demangled name
+        name_offset = 0x10 if is_64bit else 0x08
+        ti_map = {}  # type_info_rva_or_va -> (demangled_name, type_info_addr)
+        for s in bv.strings:
+            val = s.value
+            if not val or not val.startswith(".?A"):
+                continue
+            ti_addr = s.start - name_offset
+            demangled = val
+            try:
+                _, qname = bn.demangle_ms(bv.arch, val)
+                if qname:
+                    demangled = "::".join(str(part) for part in qname)
+            except Exception:
+                pass
+            if is_64bit:
+                ti_map[ti_addr - module_base] = (demangled, ti_addr)
+            else:
+                ti_map[ti_addr] = (demangled, ti_addr)
+
+        # Helper to read a pointer from section data at a given virtual address
+        def read_ptr_at(addr):
+            for _, sec_start, sec_data in scan_sections:
+                sec_end = sec_start + len(sec_data)
+                if sec_start <= addr < sec_end:
+                    off = addr - sec_start
+                    if off + ptr_size <= len(sec_data):
+                        return struct.unpack_from(ptr_fmt, sec_data, off)[0]
+            return None
+
+        # Try to resolve COL at a given address and return class name info
+        def try_resolve_col(col_ptr):
+            if not in_data(col_ptr):
+                return None
+            if is_64bit:
+                # x64 COL: sig(4)=1, offset(4), cdOffset(4), typeDescRVA(4),
+                #          classHierRVA(4), selfRVA(4) = 24 bytes
+                col_bytes_list = []
+                for _, sec_start, sec_data in scan_sections:
+                    sec_end = sec_start + len(sec_data)
+                    if sec_start <= col_ptr < sec_end:
+                        off = col_ptr - sec_start
+                        if off + 24 <= len(sec_data):
+                            col_bytes_list.append(sec_data[off:off + 24])
+                        break
+                if not col_bytes_list:
+                    return None
+                col_data = col_bytes_list[0]
+                sig = struct.unpack_from("<I", col_data, 0)[0]
+                if sig != 1:
+                    return None
+                self_rva = struct.unpack_from("<I", col_data, 20)[0]
+                expected_self_rva = (col_ptr - module_base) & 0xFFFFFFFF
+                if self_rva != expected_self_rva:
+                    return None
+                type_desc_rva = struct.unpack_from("<I", col_data, 12)[0]
+                info = ti_map.get(type_desc_rva)
+                if info:
+                    return {"class_name": info[0], "type_info_addr": hex(info[1])}
+            else:
+                # x86 COL: sig(4)=0, offset(4), cdOffset(4), typeDescPtr(4) = 16 bytes
+                col_bytes_list = []
+                for _, sec_start, sec_data in scan_sections:
+                    sec_end = sec_start + len(sec_data)
+                    if sec_start <= col_ptr < sec_end:
+                        off = col_ptr - sec_start
+                        if off + 16 <= len(sec_data):
+                            col_bytes_list.append(sec_data[off:off + 16])
+                        break
+                if not col_bytes_list:
+                    return None
+                col_data = col_bytes_list[0]
+                sig = struct.unpack_from("<I", col_data, 0)[0]
+                if sig != 0:
+                    return None
+                type_desc_ptr = struct.unpack_from("<I", col_data, 12)[0]
+                info = ti_map.get(type_desc_ptr)
+                if info:
+                    return {"class_name": info[0], "type_info_addr": hex(info[1])}
+            return None
+
+        # Scan each data section for contiguous runs of .text pointers
+        vtables = []
+        seen_addrs = set()
+
+        for sec_name, sec_start, sec_data in scan_sections:
+            sec_len = len(sec_data)
+            i = 0
+            while i + ptr_size <= sec_len:
+                val = struct.unpack_from(ptr_fmt, sec_data, i)[0]
+                if not in_text(val):
+                    i += ptr_size
+                    continue
+
+                # Found a .text pointer; count the run length
+                run_start = i
+                run_count = 0
+                j = i
+                while j + ptr_size <= sec_len:
+                    v = struct.unpack_from(ptr_fmt, sec_data, j)[0]
+                    if not in_text(v):
+                        break
+                    run_count += 1
+                    j += ptr_size
+
+                if run_count >= min_methods:
+                    vtable_addr = sec_start + run_start
+                    if vtable_addr not in seen_addrs:
+                        seen_addrs.add(vtable_addr)
+
+                        # Collect first few method addresses
+                        first_methods = []
+                        for k in range(min(run_count, 5)):
+                            off = run_start + k * ptr_size
+                            va = struct.unpack_from(ptr_fmt, sec_data, off)[0]
+                            first_methods.append(hex(va))
+
+                        # Try to resolve class name via COL at vtable[-1]
+                        class_name = None
+                        type_info_addr = None
+                        if run_start >= ptr_size:
+                            col_ptr = struct.unpack_from(
+                                ptr_fmt, sec_data, run_start - ptr_size
+                            )[0]
+                            col_info = try_resolve_col(col_ptr)
+                            if col_info:
+                                class_name = col_info["class_name"]
+                                type_info_addr = col_info["type_info_addr"]
+
+                        vtables.append({
+                            "vtable_addr": hex(vtable_addr),
+                            "num_methods": run_count,
+                            "class_name": class_name,
+                            "type_info_addr": type_info_addr,
+                            "section": sec_name,
+                            "first_methods": first_methods,
+                        })
+
+                # Advance past this run
+                i = j
+
+        # Sort: named first (alphabetically), then unnamed (by address)
+        vtables.sort(key=lambda v: (v["class_name"] is None, v["class_name"] or "", v["vtable_addr"]))
+
+        total = len(vtables)
+        named_count = sum(1 for v in vtables if v["class_name"] is not None)
+        paginated = vtables[offset:offset + limit]
+
+        return {
+            "vtables": paginated,
+            "total": total,
+            "named_count": named_count,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    def batch_label_data(self, labels: list[dict]) -> dict:
+        """Name data variables at specified addresses.
+
+        Args:
+            labels: List of dicts with 'address' (hex string or int), 'name',
+                    and optional 'size' (int, default 1).
+
+        Returns:
+            dict with 'success_count', 'failure_count', 'total', 'results'.
+        """
+        bv = self._current_view
+        if not bv:
+            return {
+                "error": "No binary loaded",
+                "success_count": 0,
+                "failure_count": 0,
+                "results": [],
+            }
+
+        results = []
+        success_count = 0
+        failure_count = 0
+
+        for item in labels:
+            addr_raw = item.get("address", "")
+            name = item.get("name", "")
+            size = item.get("size", 1)
+            result_item = {"address": addr_raw, "name": name}
+
+            try:
+                if isinstance(addr_raw, int):
+                    addr = addr_raw
+                elif isinstance(addr_raw, str):
+                    addr = int(addr_raw.strip(), 16)
+                else:
+                    result_item["status"] = "error"
+                    result_item["error"] = f"Invalid address type: {type(addr_raw)}"
+                    failure_count += 1
+                    results.append(result_item)
+                    continue
+
+                # Define a data variable if none exists
+                existing = bv.get_data_var_at(addr)
+                if existing is None:
+                    bv.define_user_data_var(addr, bn.Type.array(bn.Type.int(8, False), size))
+
+                # Set the symbol name
+                sym = bn.Symbol(bn.SymbolType.DataSymbol, addr, name)
+                bv.define_user_symbol(sym)
+
+                result_item["status"] = "ok"
+                success_count += 1
+
+            except Exception as e:
+                result_item["status"] = "error"
+                result_item["error"] = str(e)
+                failure_count += 1
+
+            results.append(result_item)
+
+        return {
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "total": len(labels),
+            "results": results,
+        }
+
+    def batch_create_functions(self, entries: list[dict]) -> dict:
+        """Create function entries at addresses that lack them.
+
+        Args:
+            entries: List of dicts with 'address' (hex string or int) and
+                     optional 'name' (string).
+
+        Returns:
+            dict with 'success_count', 'failure_count', 'total', 'results'.
+        """
+        bv = self._current_view
+        if not bv:
+            return {
+                "error": "No binary loaded",
+                "success_count": 0,
+                "failure_count": 0,
+                "results": [],
+            }
+
+        results = []
+        success_count = 0
+        failure_count = 0
+
+        for item in entries:
+            addr_raw = item.get("address", "")
+            name = item.get("name", "")
+            result_item = {"address": addr_raw, "name": name}
+
+            try:
+                if isinstance(addr_raw, int):
+                    addr = addr_raw
+                elif isinstance(addr_raw, str):
+                    addr = int(addr_raw.strip(), 16)
+                else:
+                    result_item["status"] = "error"
+                    result_item["error"] = f"Invalid address type: {type(addr_raw)}"
+                    failure_count += 1
+                    results.append(result_item)
+                    continue
+
+                # Check if function already exists
+                existing = bv.get_function_at(addr)
+                if existing:
+                    if name:
+                        old_name = existing.name
+                        existing.name = name
+                        result_item["status"] = "ok"
+                        result_item["note"] = f"Already existed as {old_name}, renamed"
+                    else:
+                        result_item["status"] = "ok"
+                        result_item["note"] = f"Already exists as {existing.name}"
+                    success_count += 1
+                else:
+                    # Create function
+                    ok = bv.create_user_function(addr)
+                    if ok is not None:
+                        if name:
+                            func = bv.get_function_at(addr)
+                            if func:
+                                func.name = name
+                        result_item["status"] = "ok"
+                        result_item["note"] = "created"
+                        success_count += 1
+                    else:
+                        result_item["status"] = "error"
+                        result_item["error"] = "create_user_function returned None"
+                        failure_count += 1
+
+            except Exception as e:
+                result_item["status"] = "error"
+                result_item["error"] = str(e)
+                failure_count += 1
+
+            results.append(result_item)
+
+        return {
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "total": len(entries),
             "results": results,
         }

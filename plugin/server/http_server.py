@@ -1817,6 +1817,33 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     bn.log_error(f"Error scanning update fields: {e}")
                     self._send_json_response({"error": str(e)}, 500)
 
+            elif path == "/wowemulation/discoverLuaTables":
+                min_entries = int(params.get("min_entries", 3))
+                try:
+                    result = self.endpoints.discover_lua_reg_tables(min_entries, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error discovering Lua tables: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/walkRttiVtables":
+                class_filter = params.get("filter", "")
+                try:
+                    result = self.endpoints.walk_rtti_vtables(class_filter, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error walking RTTI vtables: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/scanVtables":
+                min_methods = int(params.get("min_methods", 2))
+                try:
+                    result = self.endpoints.scan_vtables(min_methods, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error scanning vtables: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
             else:
                 self._send_json_response({"error": "Not found"}, 404)
 
@@ -2331,6 +2358,56 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     self._send_json_response(result)
                 except Exception as e:
                     bn.log_error(f"Error in batch rename: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/batchLabelData":
+                labels_raw = params.get("labels", "")
+                if isinstance(labels_raw, str):
+                    try:
+                        labels_list = json.loads(labels_raw)
+                    except (json.JSONDecodeError, ValueError):
+                        self._send_json_response(
+                            {"error": "Invalid JSON for labels parameter"}, 400
+                        )
+                        return
+                elif isinstance(labels_raw, list):
+                    labels_list = labels_raw
+                else:
+                    self._send_json_response(
+                        {"error": "labels must be a JSON array of {address, name} objects"}, 400
+                    )
+                    return
+
+                try:
+                    result = self.endpoints.batch_label_data(labels_list)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error in batch label data: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/batchCreateFunctions":
+                entries_raw = params.get("entries", "")
+                if isinstance(entries_raw, str):
+                    try:
+                        entries_list = json.loads(entries_raw)
+                    except (json.JSONDecodeError, ValueError):
+                        self._send_json_response(
+                            {"error": "Invalid JSON for entries parameter"}, 400
+                        )
+                        return
+                elif isinstance(entries_raw, list):
+                    entries_list = entries_raw
+                else:
+                    self._send_json_response(
+                        {"error": "entries must be a JSON array of {address, name} objects"}, 400
+                    )
+                    return
+
+                try:
+                    result = self.endpoints.batch_create_functions(entries_list)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error in batch create functions: {e}")
                     self._send_json_response({"error": str(e)}, 500)
 
             else:

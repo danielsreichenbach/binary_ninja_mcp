@@ -968,3 +968,39 @@ class BinaryNinjaEndpoints:
         if not self.binary_ops.current_view:
             raise RuntimeError("No binary loaded")
         return self.binary_ops.batch_rename_functions(renames)
+
+    def discover_lua_reg_tables(
+        self, min_entries: int = 3, offset: int = 0, limit: int = 50
+    ) -> dict:
+        """Discover luaL_Reg-style registration tables by scanning section data."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.discover_lua_reg_tables(min_entries, offset, limit)
+
+    def walk_rtti_vtables(
+        self, class_filter: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Walk RTTI vtables by scanning for COL structures with raw RVA matching."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.walk_rtti_vtables(class_filter, offset, limit)
+
+    def scan_vtables(
+        self, min_methods: int = 2, offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Scan data sections for vtable-like contiguous .text pointer runs."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.scan_vtables(min_methods, offset, limit)
+
+    def batch_label_data(self, labels: list[dict]) -> dict:
+        """Name data variables at specified addresses."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.batch_label_data(labels)
+
+    def batch_create_functions(self, entries: list[dict]) -> dict:
+        """Create function entries at addresses that lack them."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.batch_create_functions(entries)

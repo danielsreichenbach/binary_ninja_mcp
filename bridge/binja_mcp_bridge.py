@@ -1133,6 +1133,221 @@ def wowemulation_batch_rename_functions(renames: str) -> str:
     return msg
 
 
+@mcp.tool()
+def wowemulation_discover_lua_tables(
+    min_entries: int = 3, offset: int = 0, limit: int = 50
+) -> str:
+    """
+    Discover luaL_Reg-style registration tables by scanning .rdata/.data sections.
+    Finds contiguous arrays of {string_ptr, func_ptr} pairs and validates string content.
+    Returns discovered tables with method names and function addresses.
+
+    Args:
+        min_entries: Minimum entries for a run to count as a table (default 3)
+        offset: Pagination offset (on tables list)
+        limit: Maximum tables to return (default 50)
+    """
+    data = get_json(
+        "wowemulation/discoverLuaTables",
+        {"min_entries": min_entries, "offset": offset, "limit": limit},
+        timeout=60,
+    )
+    if not data:
+        return "Error: no response from server"
+    if isinstance(data, dict) and "error" in data and "tables" not in data:
+        return f"Error: {data['error']}"
+
+    tables = data.get("tables", [])
+    total = data.get("total", 0)
+    total_entries = data.get("total_entries", 0)
+    lines = [f"Lua registration tables: {len(tables)} shown, {total} total, {total_entries} total entries"]
+    for t in tables:
+        lines.append(
+            f"\n  Table @ {t.get('table_addr', '?')} ({t.get('entry_count', 0)} entries, "
+            f"section={t.get('section', '?')}, valid={t.get('valid_names', 0)})"
+        )
+        for e in t.get("entries", []):
+            name = e.get("name") or "<invalid>"
+            lines.append(f"    {name} -> {e.get('func_addr', '?')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def wowemulation_walk_rtti_vtables(
+    class_filter: str = "", offset: int = 0, limit: int = 100
+) -> str:
+    """
+    Walk RTTI vtables by scanning .rdata for COL structures via raw RVA matching.
+    Bypasses broken xrefs. Returns class names, vtable addresses, and vfunc counts.
+
+    Args:
+        class_filter: Optional substring filter on class name
+        offset: Pagination offset
+        limit: Maximum entries to return
+    """
+    data = get_json(
+        "wowemulation/walkRttiVtables",
+        {"filter": class_filter, "offset": offset, "limit": limit},
+        timeout=120,
+    )
+    if not data:
+        return "Error: no response from server"
+    if isinstance(data, dict) and "error" in data and "entries" not in data:
+        return f"Error: {data['error']}"
+
+    entries = data.get("entries", [])
+    total = data.get("total", 0)
+    lines = [f"RTTI vtables: {len(entries)} shown, {total} total"]
+    for e in entries:
+        vtable = e.get("vtable_addr") or "none"
+        vfuncs = e.get("num_vfuncs", 0)
+        first = ", ".join(e.get("first_vfuncs", [])[:3])
+        suffix = f" [{first}]" if first else ""
+        lines.append(
+            f"  {e.get('class_name', '?')} ti={e.get('type_info_addr', '?')} "
+            f"vt={vtable} ({vfuncs} vfuncs){suffix}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def wowemulation_scan_vtables(
+    min_methods: int = 2, offset: int = 0, limit: int = 100
+) -> str:
+    """
+    Scan .rdata and .data for vtable-like structures: contiguous runs of .text
+    pointers. Resolves class names via RTTI COL when present.
+
+    Complements walk_rtti_vtables by finding vtables that lack RTTI structures
+    (common in Blizzard game binaries where RTTI is stripped for game classes).
+
+    Args:
+        min_methods: Minimum number of virtual methods to report (default 2)
+        offset: Pagination offset
+        limit: Maximum entries to return
+    """
+    data = get_json(
+        "wowemulation/scanVtables",
+        {"min_methods": min_methods, "offset": offset, "limit": limit},
+        timeout=60,
+    )
+    if not data:
+        return "Error: no response from server"
+    if isinstance(data, dict) and "error" in data and "vtables" not in data:
+        return f"Error: {data['error']}"
+
+    vtables = data.get("vtables", [])
+    total = data.get("total", 0)
+    named_count = data.get("named_count", 0)
+    lines = [
+        f"Vtable scan: {len(vtables)} shown, {total} total "
+        f"({named_count} named, {total - named_count} unnamed)"
+    ]
+    for v in vtables:
+        addr = v.get("vtable_addr", "?")
+        n = v.get("num_methods", 0)
+        sec = v.get("section", "?")
+        name = v.get("class_name")
+        first = ", ".join(v.get("first_methods", [])[:3])
+        suffix = f" [{first}]" if first else ""
+        if name:
+            ti = v.get("type_info_addr", "?")
+            lines.append(f"  {name} vt={addr} ({n} methods, {sec}) ti={ti}{suffix}")
+        else:
+            lines.append(f"  <unnamed> vt={addr} ({n} methods, {sec}){suffix}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def wowemulation_batch_label_data(labels: str) -> str:
+    """
+    Name data variables at specified addresses. Accepts a JSON-encoded list of
+    {address, name, size?} objects.
+
+    Args:
+        labels: JSON string like [{"address": "0x141f6b230", "name": "g_luaReg_Frame", "size": 8}, ...]
+    """
+    import json as _json
+
+    try:
+        labels_list = _json.loads(labels)
+    except (_json.JSONDecodeError, ValueError) as e:
+        return f"Error: Invalid JSON - {e}"
+
+    if not isinstance(labels_list, list):
+        return "Error: labels must be a JSON array"
+
+    try:
+        response = requests.post(
+            f"{binja_server_url}/wowemulation/batchLabelData",
+            json={"labels": labels_list},
+            timeout=30,
+        )
+        response.encoding = "utf-8"
+        data = response.json()
+    except Exception as e:
+        return f"Error: request failed - {e}"
+
+    if isinstance(data, dict) and "error" in data and "success_count" not in data:
+        return f"Error: {data['error']}"
+
+    success = data.get("success_count", 0)
+    failure = data.get("failure_count", 0)
+    total = data.get("total", 0)
+    msg = f"Labeled {success}/{total} data variables ({failure} failures)"
+
+    for r in data.get("results", []):
+        if r.get("status") == "error":
+            msg += f"\n  FAIL {r.get('address', '?')}: {r.get('error', '?')}"
+
+    return msg
+
+
+@mcp.tool()
+def wowemulation_batch_create_functions(entries: str) -> str:
+    """
+    Create function entries at addresses that lack them. Accepts a JSON-encoded list of
+    {address, name?} objects. If a function already exists, it will be renamed if name is provided.
+
+    Args:
+        entries: JSON string like [{"address": "0x140001000", "name": "MyFunc"}, ...]
+    """
+    import json as _json
+
+    try:
+        entries_list = _json.loads(entries)
+    except (_json.JSONDecodeError, ValueError) as e:
+        return f"Error: Invalid JSON - {e}"
+
+    if not isinstance(entries_list, list):
+        return "Error: entries must be a JSON array"
+
+    try:
+        response = requests.post(
+            f"{binja_server_url}/wowemulation/batchCreateFunctions",
+            json={"entries": entries_list},
+            timeout=30,
+        )
+        response.encoding = "utf-8"
+        data = response.json()
+    except Exception as e:
+        return f"Error: request failed - {e}"
+
+    if isinstance(data, dict) and "error" in data and "success_count" not in data:
+        return f"Error: {data['error']}"
+
+    success = data.get("success_count", 0)
+    failure = data.get("failure_count", 0)
+    total = data.get("total", 0)
+    msg = f"Created/updated {success}/{total} functions ({failure} failures)"
+
+    for r in data.get("results", []):
+        if r.get("status") == "error":
+            msg += f"\n  FAIL {r.get('address', '?')}: {r.get('error', '?')}"
+
+    return msg
+
+
 if __name__ == "__main__":
     # Important: write any logs to stderr to avoid corrupting MCP stdio JSON-RPC
     print("Starting MCP bridge service...", file=_sys.stderr)
