@@ -368,6 +368,34 @@ class BinaryOperations:
 
         return functions[offset : offset + limit]
 
+    def get_function_signature(self, identifier: str | int) -> dict[str, Any] | None:
+        """Get the full signature/prototype of a function.
+
+        Args:
+            identifier: Function name or address (hex string, decimal string, or int)
+
+        Returns:
+            Dictionary with name, address, return_type, calling_convention,
+            parameters, prototype, has_variable_arguments. None if not found.
+        """
+        func = self.get_function_by_name_or_address(identifier)
+        if not func:
+            return None
+        ft = func.type
+        cc = ft.calling_convention
+        return {
+            "name": func.name,
+            "address": hex(func.start),
+            "raw_name": func.raw_name if hasattr(func, "raw_name") else func.name,
+            "return_type": str(ft.return_value),
+            "calling_convention": cc.name if cc else "",
+            "parameters": [
+                {"name": p.name, "type": str(p.type)} for p in ft.parameters
+            ],
+            "prototype": str(ft),
+            "has_variable_arguments": bool(ft.has_variable_arguments),
+        }
+
     def get_class_names(self, offset: int = 0, limit: int = 100) -> list[str]:
         """Get list of class names with pagination"""
         if not self._current_view:
@@ -1682,6 +1710,107 @@ class BinaryOperations:
             "underlying": underlying,
             "source": source,
         }
+
+    def export_analysis(
+        self,
+        include_prototypes: bool = True,
+        include_types: bool = True,
+        include_data_types: bool = True,
+        include_comments: bool = True,
+    ) -> dict[str, Any]:
+        """Export all user analysis for the active binary.
+
+        Returns a dictionary with sections controlled by the boolean flags:
+        - functions: name, address, raw_name, prototype, return_type,
+          calling_convention, parameters (name + type per param)
+        - types: full type info per user-defined type (reuses get_type_info)
+        - data_labels: address, name, type for each data variable
+        - comments: address comments and function comments
+        """
+        if not self._current_view:
+            raise RuntimeError("No binary loaded")
+
+        bv = self._current_view
+        result: dict[str, Any] = {
+            "binary": bv.file.filename,
+        }
+
+        if include_prototypes:
+            functions = []
+            for func in bv.functions:
+                entry: dict[str, Any] = {
+                    "name": func.name,
+                    "address": hex(func.start),
+                    "raw_name": func.raw_name if hasattr(func, "raw_name") else func.name,
+                }
+                try:
+                    ft = func.type
+                    cc = ft.calling_convention
+                    entry["prototype"] = str(ft)
+                    entry["return_type"] = str(ft.return_value)
+                    entry["calling_convention"] = cc.name if cc else ""
+                    entry["parameters"] = [
+                        {"name": p.name, "type": str(p.type)} for p in ft.parameters
+                    ]
+                    entry["has_variable_arguments"] = bool(ft.has_variable_arguments)
+                except Exception:
+                    entry["prototype"] = None
+                functions.append(entry)
+            result["functions"] = functions
+
+        if include_types:
+            types = []
+            try:
+                for type_name in bv.types:
+                    try:
+                        info = self.get_type_info(str(type_name))
+                        types.append(info)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            result["types"] = types
+
+        if include_data_types:
+            data_labels = []
+            try:
+                for addr, var in bv.data_vars.items():
+                    entry = {
+                        "address": hex(addr),
+                        "type": str(var.type) if var.type else None,
+                    }
+                    sym = bv.get_symbol_at(addr)
+                    entry["name"] = sym.name if sym else None
+                    data_labels.append(entry)
+            except Exception:
+                pass
+            result["data_labels"] = data_labels
+
+        if include_comments:
+            comments: dict[str, Any] = {}
+
+            # Address comments
+            addr_comments = {}
+            try:
+                for addr, text in bv.address_comments.items():
+                    addr_comments[hex(addr)] = text
+            except Exception:
+                pass
+            comments["address"] = addr_comments
+
+            # Function comments
+            func_comments = {}
+            try:
+                for func in bv.functions:
+                    if func.comment:
+                        func_comments[hex(func.start)] = func.comment
+            except Exception:
+                pass
+            comments["function"] = func_comments
+
+            result["comments"] = comments
+
+        return result
 
     def get_strings(self, offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         """Get list of strings in the current binary view with pagination.
@@ -4587,4 +4716,322 @@ class BinaryOperations:
             "failure_count": failure_count,
             "total": len(entries),
             "results": results,
+        }
+
+    def scan_lea_operands(
+        self, category: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Scan .text for instructions referencing known string addresses.
+
+        Bypasses broken xref engines by iterating target string addresses
+        and using bv.get_code_refs() or bv.get_data_refs() to find code
+        that references them. Falls back to checking all function LLIL
+        operands if get_code_refs returns nothing.
+
+        Categories: lua_api, update_field, error_enum, rtti, source_path
+
+        Returns dict with 'entries' list, 'total' count, and category breakdown.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "entries": [], "total": 0}
+
+        # Phase 1: Build target set from binary strings
+        targets = {}
+        for s in bv.strings:
+            val = s.value
+            if not val:
+                continue
+            if val.startswith("Usage: ") or val.startswith("Usage:"):
+                targets[s.start] = ("lua_api", val)
+            elif "Data::" in val and val.startswith("CG"):
+                targets[s.start] = ("update_field", val)
+            elif val.startswith("ERROR_"):
+                targets[s.start] = ("error_enum", val)
+            elif val.startswith(".?AV") or val.startswith(".?AU"):
+                targets[s.start] = ("rtti", val)
+            elif "buildserver" in val.lower() and (
+                val.lower().endswith(".cpp")
+                or val.lower().endswith(".h")
+                or val.lower().endswith(".cc")
+            ):
+                targets[s.start] = ("source_path", val)
+
+        # Apply category filter
+        if category:
+            targets = {
+                a: (c, v) for a, (c, v) in targets.items() if c == category
+            }
+
+        # Phase 2: Find code references to each target
+        results = []
+        cat_counts = {}
+
+        for target_addr, (cat, val) in targets.items():
+            refs = list(bv.get_code_refs(target_addr))
+            if not refs:
+                # Try data refs as fallback
+                refs = list(bv.get_data_refs(target_addr))
+
+            for ref in refs:
+                func = None
+                ref_addr = ref.address if hasattr(ref, "address") else ref
+                funcs = bv.get_functions_containing(ref_addr)
+                if funcs:
+                    func = funcs[0]
+
+                results.append(
+                    {
+                        "target_addr": hex(target_addr),
+                        "ref_addr": hex(ref_addr),
+                        "func_addr": hex(func.start) if func else None,
+                        "func_name": func.name if func else None,
+                        "category": cat,
+                        "value": val[:200],  # Truncate long strings
+                    }
+                )
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+        total = len(results)
+        paginated = results[offset : offset + limit]
+
+        return {
+            "entries": paginated,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "target_count": len(targets),
+            "category_breakdown": cat_counts,
+        }
+
+    def _compute_mnemonic_hash(self, func):
+        """Compute mnemonic-based hash for same-architecture matching."""
+        import hashlib
+        import struct
+
+        hasher = hashlib.sha256()
+        size = func.total_bytes
+        hasher.update(struct.pack("<Q", size))
+
+        mnemonic_count = 0
+        for block in func.basic_blocks:
+            for tokens, length in block:
+                mnemonic = tokens[0].text.strip()
+                if mnemonic:
+                    hasher.update(mnemonic.encode("utf-8"))
+                    mnemonic_count += 1
+
+        if mnemonic_count == 0:
+            return None
+
+        hasher.update(struct.pack("<I", mnemonic_count))
+        return hasher.hexdigest()
+
+    def _compute_semantic_hash(self, func):
+        """Compute semantic hash for cross-architecture matching.
+
+        Hashes architecture-independent properties: instruction count,
+        basic block count, callee count, integer constants > 0xFF,
+        and referenced string constants.
+        """
+        import hashlib
+        import struct
+
+        bv = self._current_view
+        hasher = hashlib.sha256()
+
+        # Instruction count (not byte size)
+        instr_count = 0
+        for block in func.basic_blocks:
+            for tokens, length in block:
+                instr_count += 1
+
+        if instr_count == 0:
+            return None
+
+        hasher.update(struct.pack("<I", instr_count))
+
+        # Basic block count
+        hasher.update(struct.pack("<I", len(func.basic_blocks)))
+
+        # Callee count
+        callees = set()
+        for ref in func.call_sites:
+            for callee in bv.get_functions_at(ref.address):
+                callees.add(callee.start)
+        # Also check MLIL calls
+        try:
+            for block in func.mlil.basic_blocks:
+                for instr in block:
+                    if hasattr(instr, 'dest') and hasattr(instr, 'operation'):
+                        op_name = str(instr.operation)
+                        if 'CALL' in op_name:
+                            if hasattr(instr.dest, 'constant'):
+                                callees.add(instr.dest.constant)
+        except Exception:
+            pass
+
+        hasher.update(struct.pack("<I", len(callees)))
+
+        # Integer constants > 0xFF from MLIL
+        constants = set()
+        try:
+            for block in func.mlil.basic_blocks:
+                for instr in block:
+                    for operand in instr.prefix_operands:
+                        if isinstance(operand, int) and operand > 0xFF:
+                            constants.add(operand & 0xFFFFFFFFFFFFFFFF)
+        except Exception:
+            pass
+
+        for c in sorted(constants):
+            hasher.update(struct.pack("<Q", c))
+        hasher.update(struct.pack("<I", len(constants)))
+
+        # String references
+        string_refs = []
+        for block in func.basic_blocks:
+            for ref in block.outgoing_edges:
+                pass  # edges don't help here
+        # Use data refs from the function's address range
+        for ref_addr in range(func.start, func.start + func.total_bytes):
+            pass  # Too slow, use IL instead
+
+        # Use LLIL to find string references
+        try:
+            for block in func.llil.basic_blocks:
+                for instr in block:
+                    for operand in instr.prefix_operands:
+                        if isinstance(operand, int):
+                            s = bv.get_string_at(operand)
+                            if s and s.length > 2:
+                                string_refs.append(s.value)
+        except Exception:
+            pass
+
+        for s in sorted(string_refs):
+            hasher.update(s.encode("utf-8", errors="replace"))
+        hasher.update(struct.pack("<I", len(string_refs)))
+
+        return hasher.hexdigest()
+
+    def propagate_symbols_export(
+        self, offset: int = 0, limit: int = 5000, mode: str = "mnemonic"
+    ) -> dict:
+        """Export function hashes for cross-version symbol propagation.
+
+        Two modes:
+          mnemonic - SHA-256 of size + mnemonics + count (same-arch)
+          semantic - SHA-256 of arch-independent properties (cross-arch)
+
+        Hash format matches Ghidra's propagate_symbols.py for interoperability.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "entries": [], "total": 0}
+
+        all_entries = []
+        for func in bv.functions:
+            name = func.name
+            if not name or name.startswith("sub_"):
+                continue
+
+            if mode == "semantic":
+                func_hash = self._compute_semantic_hash(func)
+            else:
+                func_hash = self._compute_mnemonic_hash(func)
+
+            if func_hash is None:
+                continue
+
+            addr_width = 16 if bv.arch.name == "x86_64" else 8
+            all_entries.append({
+                "hash": func_hash,
+                "address": f"{func.start:0{addr_width}X}",
+                "name": name,
+                "size": func.total_bytes,
+                "mode": mode,
+            })
+
+        total = len(all_entries)
+        paginated = all_entries[offset:offset + limit]
+
+        return {
+            "entries": paginated,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "mode": mode,
+        }
+
+    def propagate_symbols_import(self, source_hashes: list) -> dict:
+        """Import function hashes and rename matching unnamed functions.
+
+        source_hashes: list of dicts with 'hash', 'address', 'name', 'size',
+        and optional 'mode' (defaults to 'mnemonic').
+
+        Computes hashes for all unnamed functions in the current binary and
+        matches against the provided source hashes. Renames matched functions.
+        """
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded"}
+
+        # Build lookup from source hashes, grouped by mode
+        hash_lookup = {}  # hash -> (addr, name, size, mode)
+        modes = set()
+        for entry in source_hashes:
+            h = entry["hash"]
+            mode = entry.get("mode", "mnemonic")
+            hash_lookup[h] = (
+                entry["address"], entry["name"], int(entry["size"]), mode
+            )
+            modes.add(mode)
+
+        matched = 0
+        collisions = 0
+        total = 0
+
+        for func in bv.functions:
+            name = func.name
+            if not name.startswith("sub_"):
+                continue
+
+            total += 1
+
+            for mode in modes:
+                if mode == "semantic":
+                    func_hash = self._compute_semantic_hash(func)
+                else:
+                    func_hash = self._compute_mnemonic_hash(func)
+
+                if func_hash is None:
+                    continue
+
+                if func_hash in hash_lookup:
+                    source_addr, source_name, source_size, source_mode = \
+                        hash_lookup[func_hash]
+
+                    if source_mode != mode:
+                        continue
+
+                    # Strict size check for mnemonic mode only
+                    if mode == "mnemonic" and func.total_bytes != source_size:
+                        collisions += 1
+                        continue
+
+                    func.name = source_name
+                    func.comment = (
+                        f"Matched from source build at {source_addr} "
+                        f"({mode} mode)"
+                    )
+                    matched += 1
+                    break
+
+        return {
+            "matched": matched,
+            "collisions": collisions,
+            "total_functions": total,
+            "source_hashes_available": len(hash_lookup),
+            "modes": list(modes),
         }

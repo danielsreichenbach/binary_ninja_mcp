@@ -1274,6 +1274,49 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     bn.log_error(f"Error handling setFunctionPrototype request: {e}")
                     self._send_json_response({"error": str(e)}, 500)
+            elif path == "/getFunctionSignature":
+                ident = (
+                    params.get("name")
+                    or params.get("address")
+                    or params.get("function")
+                    or params.get("addr")
+                )
+                if not ident:
+                    self._send_json_response(
+                        {
+                            "error": "Missing parameter",
+                            "help": "Required: name or address",
+                        },
+                        400,
+                    )
+                    return
+                try:
+                    sig = self.binary_ops.get_function_signature(ident)
+                    if sig is None:
+                        self._send_json_response(
+                            {"error": f"Function not found: {ident}"}, 404
+                        )
+                    else:
+                        self._send_json_response(sig)
+                except Exception as e:
+                    bn.log_error(f"Error handling getFunctionSignature: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+            elif path == "/exportAnalysis":
+                try:
+                    inc_proto = params.get("prototypes", "true").lower() != "false"
+                    inc_types = params.get("types", "true").lower() != "false"
+                    inc_data = params.get("dataTypes", "true").lower() != "false"
+                    inc_comments = params.get("comments", "true").lower() != "false"
+                    data = self.binary_ops.export_analysis(
+                        include_prototypes=inc_proto,
+                        include_types=inc_types,
+                        include_data_types=inc_data,
+                        include_comments=inc_comments,
+                    )
+                    self._send_json_response(data)
+                except Exception as e:
+                    bn.log_error(f"Error handling exportAnalysis: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
             elif path == "/makeFunctionAt":
                 # Create a function at an address (idempotent if already exists)
                 address_str = params.get("address") or params.get("addr")
@@ -1844,6 +1887,33 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     bn.log_error(f"Error scanning vtables: {e}")
                     self._send_json_response({"error": str(e)}, 500)
 
+            elif path == "/wowemulation/scanLeaOperands":
+                category = params.get("category", "")
+                try:
+                    result = self.endpoints.scan_lea_operands(category, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error scanning LEA operands: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/propagateSymbols":
+                mode = params.get("mode", "export")
+                hash_mode = params.get("hash_mode", "mnemonic")
+                try:
+                    if mode == "export":
+                        result = self.endpoints.propagate_symbols_export(
+                            offset, limit, hash_mode
+                        )
+                    else:
+                        self._send_json_response(
+                            {"error": "Use POST for import mode"}, 400
+                        )
+                        return
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error in symbol propagation: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
             else:
                 self._send_json_response({"error": "Not found"}, 404)
 
@@ -2408,6 +2478,26 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     self._send_json_response(result)
                 except Exception as e:
                     bn.log_error(f"Error in batch create functions: {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/wowemulation/propagateSymbols":
+                mode = params.get("mode", "import")
+                if mode != "import":
+                    self._send_json_response(
+                        {"error": "Use GET for export mode"}, 400
+                    )
+                    return
+                source_hashes = params.get("source_hashes", [])
+                if not isinstance(source_hashes, list) or not source_hashes:
+                    self._send_json_response(
+                        {"error": "source_hashes must be a non-empty list"}, 400
+                    )
+                    return
+                try:
+                    result = self.endpoints.propagate_symbols_import(source_hashes)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error in symbol propagation import: {e}")
                     self._send_json_response({"error": str(e)}, 500)
 
             else:

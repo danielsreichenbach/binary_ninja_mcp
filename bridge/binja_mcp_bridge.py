@@ -843,6 +843,61 @@ def set_function_prototype(name_or_address: str, prototype: str) -> str:
 
 
 @mcp.tool()
+def get_function_signature(function_identifier: str) -> str:
+    """
+    Get the full signature/prototype of a function by name or address.
+    Returns JSON with name, address, return_type, calling_convention, parameters, prototype.
+    """
+    ident = (function_identifier or "").strip()
+    params = {}
+    if ident.lower().startswith("0x") or ident.isdigit():
+        params["address"] = ident
+    else:
+        params["name"] = ident
+    data = get_json("getFunctionSignature", params, timeout=None)
+    if not data:
+        return "Error: no response"
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+    import json as _json
+
+    return _json.dumps(data, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def export_analysis(
+    include_prototypes: bool = True,
+    include_types: bool = True,
+    include_data_types: bool = True,
+    include_comments: bool = True,
+) -> str:
+    """
+    Export all user analysis from the active binary.
+    Returns JSON with functions (name, address, prototype, parameters),
+    types (structs, enums with members), data_labels (address, name, type),
+    and comments (address + function comments).
+    Each section can be toggled off to reduce output size.
+    """
+    params = {}
+    if not include_prototypes:
+        params["prototypes"] = "false"
+    if not include_types:
+        params["types"] = "false"
+    if not include_data_types:
+        params["dataTypes"] = "false"
+    if not include_comments:
+        params["comments"] = "false"
+    data = get_json("exportAnalysis", params, timeout=None)
+    if not data:
+        return "Error: no response"
+    if isinstance(data, dict) and "error" in data:
+        return f"Error: {data['error']}"
+    import json as _json
+
+    return _json.dumps(data, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
 def make_function_at(address: str, platform: str = "") -> str:
     """
     Create a function at the given address. Platform is optional (e.g., "linux-x86_64").
@@ -1346,6 +1401,170 @@ def wowemulation_batch_create_functions(entries: str) -> str:
             msg += f"\n  FAIL {r.get('address', '?')}: {r.get('error', '?')}"
 
     return msg
+
+
+@mcp.tool()
+def wowemulation_scan_lea_operands(
+    category: str = "", offset: int = 0, limit: int = 100
+) -> str:
+    """
+    Scan .text for instructions referencing known string addresses. Bypasses broken
+    xref engines by iterating target string addresses and checking code/data refs.
+
+    Categories: lua_api, update_field, error_enum, rtti, source_path
+
+    Args:
+        category: Filter to one category (empty = all)
+        offset: Pagination offset
+        limit: Maximum entries to return
+    """
+    try:
+        response = requests.get(
+            f"{binja_server_url}/wowemulation/scanLeaOperands",
+            params={"category": category, "offset": offset, "limit": limit},
+            timeout=120,
+        )
+        response.encoding = "utf-8"
+        data = response.json()
+    except Exception as e:
+        return f"Error: request failed - {e}"
+
+    if isinstance(data, dict) and "error" in data and "total" not in data:
+        return f"Error: {data['error']}"
+
+    total = data.get("total", 0)
+    target_count = data.get("target_count", 0)
+    cat_breakdown = data.get("category_breakdown", {})
+
+    lines = [f"LEA operand scan: {total} references found across {target_count} target strings"]
+    if cat_breakdown:
+        lines.append("Category breakdown:")
+        for cat, count in sorted(cat_breakdown.items()):
+            lines.append(f"  {cat}: {count}")
+
+    entries = data.get("entries", [])
+    lines.append(f"\nShowing {len(entries)} entries (offset={offset}):")
+    for e in entries:
+        func_name = e.get("func_name", "(unknown)")
+        func_addr = e.get("func_addr", "?")
+        cat = e.get("category", "?")
+        val = e.get("value", "")
+        lines.append(f"  {func_addr} {func_name} [{cat}] {val[:120]}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def wowemulation_propagate_symbols(
+    mode: str = "export",
+    hash_file: str = "",
+    hash_mode: str = "mnemonic",
+    offset: int = 0,
+    limit: int = 5000,
+) -> str:
+    """
+    Cross-version symbol propagation via function-level hashing.
+
+    Two hash modes:
+      mnemonic - SHA-256 of size + mnemonics + count (same-architecture)
+      semantic - SHA-256 of arch-independent properties (cross-architecture)
+
+    Two operation modes:
+      export - Export hashes of all named functions
+      import - Import hashes from a file and rename matching unnamed functions
+
+    Args:
+        mode: 'export' or 'import'
+        hash_file: Path to hash file (required for import, optional for export)
+        hash_mode: 'mnemonic' or 'semantic' (export mode only)
+        offset: Pagination offset (export mode only)
+        limit: Maximum entries to return (export mode only)
+    """
+    if mode == "export":
+        try:
+            response = requests.get(
+                f"{binja_server_url}/wowemulation/propagateSymbols",
+                params={
+                    "mode": "export",
+                    "hash_mode": hash_mode,
+                    "offset": offset,
+                    "limit": limit,
+                },
+                timeout=300,
+            )
+            response.encoding = "utf-8"
+            data = response.json()
+        except Exception as e:
+            return f"Error: request failed - {e}"
+
+        if isinstance(data, dict) and "error" in data and "entries" not in data:
+            return f"Error: {data['error']}"
+
+        total = data.get("total", 0)
+        entries = data.get("entries", [])
+
+        lines = [f"Exported {len(entries)}/{total} function hashes"]
+        for e in entries[:20]:
+            lines.append(f"  {e['address']} {e['name']} (size={e['size']})")
+        if len(entries) > 20:
+            lines.append(f"  ... and {len(entries) - 20} more")
+
+        return "\n".join(lines)
+
+    elif mode == "import":
+        if not hash_file:
+            return "Error: hash_file path required for import mode"
+
+        # Read hash file
+        source_hashes = []
+        try:
+            with open(hash_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        source_hashes.append({
+                            "hash": parts[0],
+                            "address": parts[1],
+                            "name": parts[2],
+                            "size": int(parts[3]),
+                        })
+        except Exception as e:
+            return f"Error reading hash file: {e}"
+
+        if not source_hashes:
+            return "Error: no valid hashes found in file"
+
+        try:
+            response = requests.post(
+                f"{binja_server_url}/wowemulation/propagateSymbols",
+                json={"mode": "import", "source_hashes": source_hashes},
+                timeout=600,
+            )
+            response.encoding = "utf-8"
+            data = response.json()
+        except Exception as e:
+            return f"Error: request failed - {e}"
+
+        if isinstance(data, dict) and "error" in data:
+            return f"Error: {data['error']}"
+
+        matched = data.get("matched", 0)
+        total = data.get("total_functions", 0)
+        collisions = data.get("collisions", 0)
+
+        return (
+            f"Propagation results:\n"
+            f"  Matched: {matched}\n"
+            f"  Total unnamed functions: {total}\n"
+            f"  Hash collisions (size mismatch): {collisions}\n"
+            f"  Source hashes loaded: {len(source_hashes)}"
+        )
+
+    else:
+        return f"Unknown mode '{mode}'. Use 'export' or 'import'."
 
 
 if __name__ == "__main__":

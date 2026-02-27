@@ -1004,3 +1004,25 @@ class BinaryNinjaEndpoints:
         if not self.binary_ops.current_view:
             raise RuntimeError("No binary loaded")
         return self.binary_ops.batch_create_functions(entries)
+
+    def scan_lea_operands(
+        self, category: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Scan .text for instructions referencing known string addresses."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.scan_lea_operands(category, offset, limit)
+
+    def propagate_symbols_export(
+        self, offset: int = 0, limit: int = 5000, mode: str = "mnemonic"
+    ) -> dict:
+        """Export function hashes for cross-version propagation."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.propagate_symbols_export(offset, limit, mode)
+
+    def propagate_symbols_import(self, source_hashes: list) -> dict:
+        """Import hashes and rename matching unnamed functions."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.propagate_symbols_import(source_hashes)
