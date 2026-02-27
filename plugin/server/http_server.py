@@ -1972,10 +1972,6 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if not self._check_binary_loaded():
-                return
-            assert self.binary_ops is not None
-
             params = self._parse_post_params()
             path = urllib.parse.urlparse(self.path).path
 
@@ -1994,8 +1990,14 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as e:
                     self._send_json_response({"error": str(e)}, 500)
+                return
 
-            elif path == "/rename/function" or path == "/renameFunction":
+            # All other POST routes require a loaded binary
+            if not self._check_binary_loaded():
+                return
+            assert self.binary_ops is not None
+
+            if path == "/rename/function" or path == "/renameFunction":
                 old_name = params.get("oldName") or params.get("old_name")
                 new_name = params.get("newName") or params.get("new_name")
 

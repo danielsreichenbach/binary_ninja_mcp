@@ -39,40 +39,27 @@ class BinaryOperations:
             bn.log_info("Cleared current binary view")
 
     def load_binary(self, filepath: str) -> bn.BinaryView:
-        """Load a binary file using the appropriate method based on the Binary Ninja API version"""
+        """Load a binary file or bndb database.
+
+        Uses bn.load() (BN 4.0+) with bn.open_view() as fallback.
+        """
         try:
-            if hasattr(bn, "open_view"):
-                bn.log_info("Using bn.open_view method")
+            if hasattr(bn, "load"):
+                bn.log_info(f"Loading binary with bn.load: {filepath}")
+                self._current_view = bn.load(filepath)
+            elif hasattr(bn, "open_view"):
+                bn.log_info(f"Loading binary with bn.open_view: {filepath}")
                 self._current_view = bn.open_view(filepath)
-            elif hasattr(bn, "BinaryViewType") and hasattr(bn.BinaryViewType, "get_view_of_file"):
-                bn.log_info("Using BinaryViewType.get_view_of_file method")
-                file_metadata = bn.FileMetadata()
-                try:
-                    if hasattr(bn.BinaryViewType, "get_default_options"):
-                        options = bn.BinaryViewType.get_default_options()
-                        self._current_view = bn.BinaryViewType.get_view_of_file(
-                            filepath, file_metadata, options
-                        )
-                    else:
-                        self._current_view = bn.BinaryViewType.get_view_of_file(
-                            filepath, file_metadata
-                        )
-                except TypeError:
-                    self._current_view = bn.BinaryViewType.get_view_of_file(filepath)
             else:
-                bn.log_info("Using legacy method")
-                file_metadata = bn.FileMetadata()
-                binary_view_type = bn.BinaryViewType.get_view_of_file_with_options(
-                    filepath, file_metadata
+                raise RuntimeError(
+                    "Binary Ninja API too old: neither bn.load() nor bn.open_view() available"
                 )
-                if binary_view_type:
-                    self._current_view = binary_view_type.open()
-                else:
-                    raise Exception("No view type available for this file")
+
+            if self._current_view is None:
+                raise RuntimeError(f"Failed to open: {filepath}")
 
             try:
-                if self._current_view is not None:
-                    self._register_view(self._current_view)
+                self._register_view(self._current_view)
             except Exception:
                 pass
             return self._current_view
