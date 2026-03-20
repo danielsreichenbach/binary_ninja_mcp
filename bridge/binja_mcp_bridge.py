@@ -10,13 +10,55 @@ def _bridge_excepthook(exc_type, exc, tb):
 
 _sys.excepthook = _bridge_excepthook
 
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from typing import Any
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
 binja_server_url = "http://localhost:9009"
-mcp = FastMCP("binja-mcp")
+mcp = FastMCP("binaryninja")
+
+# Thread pool for HTTP requests to Binary Ninja.
+# Binary Ninja's plugin HTTP server is single-threaded, so we use a
+# serializing semaphore to avoid overwhelming it while still allowing
+# multiple MCP tool calls to be queued concurrently. This prevents one
+# slow decompilation from blocking the entire MCP server.
+_http_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="binja-http")
+_binja_semaphore = threading.Semaphore(1)
+
+
+def _do_get(url: str, timeout: float | None) -> requests.Response:
+    """Execute a GET request under the Binary Ninja semaphore."""
+    with _binja_semaphore:
+        if timeout is None:
+            return requests.get(url)
+        return requests.get(url, timeout=timeout)
+
+
+def _do_post(url: str, timeout: float | None, **kwargs) -> requests.Response:
+    """Execute a POST request under the Binary Ninja semaphore."""
+    with _binja_semaphore:
+        if timeout is None:
+            return requests.post(url, **kwargs)
+        return requests.post(url, timeout=timeout, **kwargs)
+
+
+async def _async_get(url: str, timeout: float | None) -> requests.Response:
+    """Run a GET request in the thread pool without blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_http_pool, _do_get, url, timeout)
+
+
+async def _async_post(url: str, timeout: float | None, **kwargs) -> requests.Response:
+    """Run a POST request in the thread pool without blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    import functools
+    fn = functools.partial(_do_post, url, timeout, **kwargs)
+    return await loop.run_in_executor(_http_pool, fn)
 
 
 def _active_filename() -> str:
@@ -30,10 +72,8 @@ def _active_filename() -> str:
     return "(none)"
 
 
-def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 5) -> list:
-    """
-    Perform a GET request. If 'params' is given, we convert it to a query string.
-    """
+def _build_url(endpoint: str, params: dict | None = None) -> str:
+    """Build a full URL with query string from endpoint and params."""
     if params is None:
         params = {}
     qs = [f"{k}={v}" for k, v in params.items()]
@@ -41,12 +81,29 @@ def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 
     url = f"{binja_server_url}/{endpoint}"
     if query_string:
         url += "?" + query_string
+    return url
+
+
+def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 30) -> list:
+    """
+    Perform a GET request. If 'params' is given, we convert it to a query string.
+    Runs in a thread pool so it does not block the async event loop.
+    """
+    url = _build_url(endpoint, params)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
     try:
-        if timeout is None:
-            response = requests.get(url)
+        if loop and loop.is_running():
+            # Called from async context -- cannot use .result() directly,
+            # but FastMCP tool functions are sync, called from a thread
+            # via run_in_executor already. Use direct blocking call with
+            # the semaphore to serialize access to BinaryNinja.
+            response = _do_get(url, timeout)
         else:
-            response = requests.get(url, timeout=timeout)
+            response = _do_get(url, timeout)
         response.encoding = "utf-8"
         if response.ok:
             return response.text.splitlines()
@@ -56,25 +113,17 @@ def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 
         return [f"Request failed: {e!s}"]
 
 
-def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 5) -> Any:
+def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 30) -> Any:
     """
     Perform a GET and return parsed JSON.
     - On 2xx: returns parsed JSON.
     - On 4xx/5xx: attempts to parse JSON body and return it; if not JSON, returns {'error': 'Error <code>: <text>'}.
     Returns None only on transport errors.
+    Serialized through the BinaryNinja semaphore.
     """
-    if params is None:
-        params = {}
-    qs = [f"{k}={v}" for k, v in params.items()]
-    query_string = "&".join(qs)
-    url = f"{binja_server_url}/{endpoint}"
-    if query_string:
-        url += "?" + query_string
+    url = _build_url(endpoint, params)
     try:
-        if timeout is None:
-            response = requests.get(url)
-        else:
-            response = requests.get(url, timeout=timeout)
+        response = _do_get(url, timeout)
         response.encoding = "utf-8"
         # Try to parse JSON regardless of status
         try:
@@ -96,20 +145,12 @@ def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 
         return {"error": f"Request failed: {e!s}"}
 
 
-def get_text(endpoint: str, params: dict | None = None, timeout: float | None = 5) -> str:
-    """Perform a GET and return raw text (or an error string)."""
-    if params is None:
-        params = {}
-    qs = [f"{k}={v}" for k, v in params.items()]
-    query_string = "&".join(qs)
-    url = f"{binja_server_url}/{endpoint}"
-    if query_string:
-        url += "?" + query_string
+def get_text(endpoint: str, params: dict | None = None, timeout: float | None = 30) -> str:
+    """Perform a GET and return raw text (or an error string).
+    Serialized through the BinaryNinja semaphore."""
+    url = _build_url(endpoint, params)
     try:
-        if timeout is None:
-            response = requests.get(url)
-        else:
-            response = requests.get(url, timeout=timeout)
+        response = _do_get(url, timeout)
         response.encoding = "utf-8"
         if response.ok:
             return response.text
@@ -120,12 +161,13 @@ def get_text(endpoint: str, params: dict | None = None, timeout: float | None = 
 
 
 def safe_post(endpoint: str, data: dict | str) -> str:
+    """Perform a POST request. Serialized through the BinaryNinja semaphore."""
     try:
         if isinstance(data, dict):
-            response = requests.post(f"{binja_server_url}/{endpoint}", data=data, timeout=5)
+            response = _do_post(f"{binja_server_url}/{endpoint}", 30, data=data)
         else:
-            response = requests.post(
-                f"{binja_server_url}/{endpoint}", data=data.encode("utf-8"), timeout=5
+            response = _do_post(
+                f"{binja_server_url}/{endpoint}", 30, data=data.encode("utf-8")
             )
         response.encoding = "utf-8"
         if response.ok:
@@ -1162,10 +1204,10 @@ def wowemulation_batch_rename_functions(renames: str) -> str:
         return "Error: renames must be a JSON array"
 
     try:
-        response = requests.post(
+        response = _do_post(
             f"{binja_server_url}/wowemulation/batchRename",
+            30,
             json={"renames": renames_list},
-            timeout=30,
         )
         response.encoding = "utf-8"
         data = response.json()
@@ -1333,10 +1375,10 @@ def wowemulation_batch_label_data(labels: str) -> str:
         return "Error: labels must be a JSON array"
 
     try:
-        response = requests.post(
+        response = _do_post(
             f"{binja_server_url}/wowemulation/batchLabelData",
+            30,
             json={"labels": labels_list},
-            timeout=30,
         )
         response.encoding = "utf-8"
         data = response.json()
@@ -1378,10 +1420,10 @@ def wowemulation_batch_create_functions(entries: str) -> str:
         return "Error: entries must be a JSON array"
 
     try:
-        response = requests.post(
+        response = _do_post(
             f"{binja_server_url}/wowemulation/batchCreateFunctions",
+            30,
             json={"entries": entries_list},
-            timeout=30,
         )
         response.encoding = "utf-8"
         data = response.json()
@@ -1419,11 +1461,8 @@ def wowemulation_scan_lea_operands(
         limit: Maximum entries to return
     """
     try:
-        response = requests.get(
-            f"{binja_server_url}/wowemulation/scanLeaOperands",
-            params={"category": category, "offset": offset, "limit": limit},
-            timeout=120,
-        )
+        url = _build_url("wowemulation/scanLeaOperands", {"category": category, "offset": offset, "limit": limit})
+        response = _do_get(url, 120)
         response.encoding = "utf-8"
         data = response.json()
     except Exception as e:
@@ -1482,16 +1521,13 @@ def wowemulation_propagate_symbols(
     """
     if mode == "export":
         try:
-            response = requests.get(
-                f"{binja_server_url}/wowemulation/propagateSymbols",
-                params={
-                    "mode": "export",
-                    "hash_mode": hash_mode,
-                    "offset": offset,
-                    "limit": limit,
-                },
-                timeout=300,
-            )
+            url = _build_url("wowemulation/propagateSymbols", {
+                "mode": "export",
+                "hash_mode": hash_mode,
+                "offset": offset,
+                "limit": limit,
+            })
+            response = _do_get(url, 300)
             response.encoding = "utf-8"
             data = response.json()
         except Exception as e:
@@ -1503,9 +1539,28 @@ def wowemulation_propagate_symbols(
         total = data.get("total", 0)
         entries = data.get("entries", [])
 
+        # Write to disk if hash_file is provided
+        if hash_file:
+            try:
+                import os
+                os.makedirs(os.path.dirname(os.path.abspath(hash_file)), exist_ok=True)
+                with open(hash_file, "w") as f:
+                    f.write(f"# Exported {len(entries)}/{total} function hashes\n")
+                    f.write(f"# hash_mode: {hash_mode}\n")
+                    f.write(f"# Format: hash address name size\n")
+                    for e in entries:
+                        f.write(f"{e['hash']} {e['address']} {e['name']} {e['size']}\n")
+                file_msg = f"Wrote {len(entries)} entries to {hash_file}"
+            except Exception as write_err:
+                file_msg = f"Failed to write hash file: {write_err}"
+        else:
+            file_msg = None
+
         lines = [f"Exported {len(entries)}/{total} function hashes"]
+        if file_msg:
+            lines.append(file_msg)
         for e in entries[:20]:
-            lines.append(f"  {e['address']} {e['name']} (size={e['size']})")
+            lines.append(f"  {e['hash'][:16]}... {e['address']} {e['name']} (size={e['size']})")
         if len(entries) > 20:
             lines.append(f"  ... and {len(entries) - 20} more")
 
@@ -1538,10 +1593,10 @@ def wowemulation_propagate_symbols(
             return "Error: no valid hashes found in file"
 
         try:
-            response = requests.post(
+            response = _do_post(
                 f"{binja_server_url}/wowemulation/propagateSymbols",
+                600,
                 json={"mode": "import", "source_hashes": source_hashes},
-                timeout=600,
             )
             response.encoding = "utf-8"
             data = response.json()

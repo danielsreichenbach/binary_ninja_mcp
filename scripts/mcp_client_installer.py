@@ -22,7 +22,7 @@ except ImportError:
 
 
 # Unique key used in MCP client configs
-MCP_SERVER_KEY = "binary_ninja_mcp"
+MCP_SERVER_KEY = "binaryninja"
 
 
 def _repo_root() -> str:

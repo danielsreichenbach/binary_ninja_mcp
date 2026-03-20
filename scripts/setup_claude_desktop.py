@@ -158,7 +158,7 @@ def setup_claude_desktop():
         if "mcpServers" not in config:
             config["mcpServers"] = {}
 
-        config["mcpServers"]["binary_ninja_mcp"] = {
+        config["mcpServers"]["binaryninja"] = {
             "command": _ensure_plugin_venv(plugin_root),
             "args": [str(src_dir / "binja_mcp_bridge.py")],
         }

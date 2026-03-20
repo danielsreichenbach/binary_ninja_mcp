@@ -156,7 +156,7 @@ def install_mcp_clients(quiet: bool = True) -> int:
     re-running on every Binary Ninja start.
     """
     sentinel = _sentinel_path()
-    server_key = "binary_ninja_mcp"
+    server_key = "binaryninja"
     if os.path.exists(sentinel):
         # If sentinel exists but no client has our key yet, proceed anyway
         try:
@@ -206,7 +206,7 @@ def install_mcp_clients(quiet: bool = True) -> int:
         servers = config["mcpServers"]
 
         # If a legacy key exists, copy into new key without removing legacy
-        legacy_key = "binary_ninja_mcp_max"
+        legacy_key = "binary_ninja_mcp"
         if legacy_key in servers and server_key not in servers:
             try:
                 legacy_cfg = dict(servers[legacy_key])
