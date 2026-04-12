@@ -1013,6 +1013,14 @@ class BinaryNinjaEndpoints:
             raise RuntimeError("No binary loaded")
         return self.binary_ops.scan_lea_operands(category, offset, limit)
 
+    def scan_lea_operands_raw(
+        self, category: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Scan .text raw bytes for RIP-relative LEA instructions (Arxan-resistant)."""
+        if not self.binary_ops.current_view:
+            raise RuntimeError("No binary loaded")
+        return self.binary_ops.scan_lea_operands_raw(category, offset, limit)
+
     def propagate_symbols_export(
         self, offset: int = 0, limit: int = 5000, mode: str = "mnemonic"
     ) -> dict:

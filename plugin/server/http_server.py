@@ -1896,6 +1896,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     bn.log_error(f"Error scanning LEA operands: {e}")
                     self._send_json_response({"error": str(e)}, 500)
 
+            elif path == "/wowemulation/scanLeaOperandsRaw":
+                category = params.get("category", "")
+                try:
+                    result = self.endpoints.scan_lea_operands_raw(category, offset, limit)
+                    self._send_json_response(result)
+                except Exception as e:
+                    bn.log_error(f"Error scanning LEA operands (raw): {e}")
+                    self._send_json_response({"error": str(e)}, 500)
+
             elif path == "/wowemulation/propagateSymbols":
                 mode = params.get("mode", "export")
                 hash_mode = params.get("hash_mode", "mnemonic")

@@ -1494,6 +1494,58 @@ def wowemulation_scan_lea_operands(
 
 
 @mcp.tool()
+def wowemulation_scan_lea_operands_raw(
+    category: str = "", offset: int = 0, limit: int = 100
+) -> str:
+    """
+    Scan .text raw bytes for RIP-relative LEA/MOV instructions referencing known
+    string addresses. Does NOT rely on BN's xref engine — Arxan-resistant.
+
+    Decodes x86-64 RIP-relative addressing (LEA reg,[RIP+disp32]) by reading
+    raw .text bytes and computing target addresses from instruction encoding.
+
+    Categories: lua_api, update_field, error_enum, rtti, source_path
+
+    Args:
+        category: Filter to one category (empty = all)
+        offset: Pagination offset
+        limit: Maximum entries to return
+    """
+    try:
+        url = _build_url("wowemulation/scanLeaOperandsRaw", {"category": category, "offset": offset, "limit": limit})
+        response = _do_get(url, 600)  # Long timeout — scanning 28MB of .text
+        response.encoding = "utf-8"
+        data = response.json()
+    except Exception as e:
+        return f"Error: request failed - {e}"
+
+    if isinstance(data, dict) and "error" in data and "total" not in data:
+        return f"Error: {data['error']}"
+
+    total = data.get("total", 0)
+    target_count = data.get("target_count", 0)
+    cat_breakdown = data.get("category_breakdown", {})
+
+    lines = [f"Raw LEA scan: {total} references found across {target_count} target strings"]
+    if cat_breakdown:
+        lines.append("Category breakdown:")
+        for cat, count in sorted(cat_breakdown.items()):
+            lines.append(f"  {cat}: {count}")
+
+    entries = data.get("entries", [])
+    lines.append(f"\nShowing {len(entries)} entries (offset={offset}):")
+    for e in entries:
+        func_name = e.get("func_name", "(unknown)")
+        func_addr = e.get("func_addr", "?")
+        instr_addr = e.get("instr_addr", "?")
+        cat = e.get("category", "?")
+        val = e.get("value", "")
+        lines.append(f"  {instr_addr} in {func_addr} {func_name} [{cat}] {val[:120]}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def wowemulation_propagate_symbols(
     mode: str = "export",
     hash_file: str = "",

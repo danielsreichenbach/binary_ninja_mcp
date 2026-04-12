@@ -4791,6 +4791,177 @@ class BinaryOperations:
             "category_breakdown": cat_counts,
         }
 
+    def scan_lea_operands_raw(
+        self, category: str = "", offset: int = 0, limit: int = 100
+    ) -> dict:
+        """Scan .text raw bytes for RIP-relative LEA/MOV instructions referencing
+        known string addresses. Does NOT rely on BN's xref engine.
+
+        This is the Arxan-resistant variant of scan_lea_operands. It reads raw
+        .text bytes and decodes x86-64 RIP-relative addressing manually.
+
+        On x86-64, LEA reg, [RIP+disp32] encodes as:
+          REX prefix (optional 0x48/0x4C) + 0x8D + ModR/M(xx 000 101) + disp32
+        MOV reg, [RIP+disp32] encodes similarly with opcode 0x8B.
+
+        Categories: lua_api, update_field, error_enum, rtti, source_path
+        """
+        import struct as _struct
+
+        bv = self._current_view
+        if not bv:
+            return {"error": "No binary loaded", "entries": [], "total": 0}
+
+        # Phase 1: Build target address set from binary strings
+        targets = {}
+        for s in bv.strings:
+            val = s.value
+            if not val:
+                continue
+            if val.startswith("Usage: ") or val.startswith("Usage:"):
+                targets[s.start] = ("lua_api", val)
+            elif "Data::" in val and val.startswith("CG"):
+                targets[s.start] = ("update_field", val)
+            elif val.startswith("ERROR_"):
+                targets[s.start] = ("error_enum", val)
+            elif val.startswith(".?AV") or val.startswith(".?AU"):
+                targets[s.start] = ("rtti", val)
+            elif "buildserver" in val.lower() and (
+                val.lower().endswith(".cpp")
+                or val.lower().endswith(".h")
+                or val.lower().endswith(".cc")
+            ):
+                targets[s.start] = ("source_path", val)
+
+        if category:
+            targets = {
+                a: (c, v) for a, (c, v) in targets.items() if c == category
+            }
+
+        if not targets:
+            return {
+                "entries": [],
+                "total": 0,
+                "target_count": 0,
+                "category_breakdown": {},
+            }
+
+        target_addrs = set(targets.keys())
+
+        # Phase 2: Find .text section bounds
+        text_start = None
+        text_end = None
+        for section in bv.sections.values():
+            if section.name == ".text":
+                text_start = section.start
+                text_end = section.end
+                break
+
+        if text_start is None:
+            return {"error": ".text section not found", "entries": [], "total": 0}
+
+        text_size = text_end - text_start
+
+        # Phase 3: Read .text raw bytes
+        raw = bv.read(text_start, text_size)
+        if not raw or len(raw) < text_size:
+            return {
+                "error": f"Failed to read .text ({text_size} bytes)",
+                "entries": [],
+                "total": 0,
+            }
+
+        # Phase 4: Scan for RIP-relative LEA and MOV instructions
+        # Pattern: [REX] opcode ModR/M disp32
+        # REX.W prefixes: 0x48, 0x4C (with REX.R)
+        # LEA opcode: 0x8D, MOV opcode: 0x8B
+        # ModR/M for RIP-relative: mode=00, R/M=101 -> (reg << 3) | 0x05
+        # Valid ModR/M bytes: 0x05,0x0D,0x15,0x1D,0x25,0x2D,0x35,0x3D
+        rip_modrm_bytes = {0x05, 0x0D, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D}
+        results = []
+        cat_counts = {}
+        seen = set()
+
+        i = 0
+        while i < text_size - 7:
+            b0 = raw[i]
+
+            # Check for REX.W prefix (0x48 or 0x4C)
+            rex = 0
+            if b0 == 0x48 or b0 == 0x4C:
+                rex = b0
+                opcode = raw[i + 1] if i + 1 < text_size else 0
+                modrm_off = i + 2
+                instr_len = 7  # REX + opcode + ModR/M + disp32
+            elif b0 == 0x8D or b0 == 0x8B:
+                opcode = b0
+                modrm_off = i + 1
+                instr_len = 6  # opcode + ModR/M + disp32
+            else:
+                i += 1
+                continue
+
+            if opcode not in (0x8D, 0x8B):
+                i += 1
+                continue
+
+            if modrm_off >= text_size:
+                i += 1
+                continue
+
+            modrm = raw[modrm_off]
+            if modrm not in rip_modrm_bytes:
+                i += 1
+                continue
+
+            disp_off = modrm_off + 1
+            if disp_off + 4 > text_size:
+                i += 1
+                continue
+
+            disp32 = _struct.unpack_from("<i", raw, disp_off)[0]
+            instr_addr = text_start + i
+            # RIP-relative: target = instruction_end + displacement
+            instr_end = text_start + i + instr_len
+            target = instr_end + disp32
+
+            if target in target_addrs:
+                key = (instr_addr, target)
+                if key not in seen:
+                    seen.add(key)
+                    cat, val = targets[target]
+
+                    func = None
+                    funcs = bv.get_functions_containing(instr_addr)
+                    if funcs:
+                        func = funcs[0]
+
+                    results.append(
+                        {
+                            "instr_addr": hex(instr_addr),
+                            "target_addr": hex(target),
+                            "func_addr": hex(func.start) if func else None,
+                            "func_name": func.name if func else None,
+                            "category": cat,
+                            "value": val[:200],
+                        }
+                    )
+                    cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+            i += 1
+
+        total = len(results)
+        paginated = results[offset : offset + limit]
+
+        return {
+            "entries": paginated,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "target_count": len(targets),
+            "category_breakdown": cat_counts,
+        }
+
     def _compute_mnemonic_hash(self, func):
         """Compute mnemonic-based hash for same-architecture matching."""
         import hashlib
